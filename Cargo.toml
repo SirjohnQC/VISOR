@@ -1,0 +1,27 @@
+[package]
+name = "visor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "visor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "visor"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+humantime-serde = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
