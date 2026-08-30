@@ -84,9 +84,34 @@ fn step(&mut self, idle: Duration, face: FaceResult, now: Instant)
 | `Active` | closed | full | Input seen within `idle_grace`. The common case. |
 | `Watching` | open @ `sample_interval` | full | Input idle, face still being seen. |
 | `Dimmed` | open @ `sample_interval` | dim | No face for `dim_after`. |
-| `Away` | open @ `away_sample` | off | No face for `away_after`. |
+| `Away` | open @ `away_sample` | black, panel powered | No face for `away_after`. |
+| `Deep` | open @ `away_sample` | panel powered off | No face for `deep_after`. |
 | `Paused` | closed | full | User pause from tray. |
 | `Degraded` | closed | full | Camera failed repeatedly. VISOR stands down. |
+
+**Why `Away` and `Deep` are separate.** On OLED, an opaque black overlay turns
+the pixels genuinely off — it captures effectively all of the burn-in benefit
+and most of the power benefit **without power-cycling the panel**, and it
+restores instantly because waking is just destroying a window. True DPMS
+power-off saves the remaining panel electronics but costs a 1-2s wake and a
+power cycle.
+
+That distinction matters more than it first appears. LG OLED panels run
+pixel-cleaning/compensation cycles *while powered off*, and those cycles are
+interrupted when the power state changes mid-cycle. Blanking the panel 75
+seconds after every trip to the kettle would power-cycle it many times a day.
+Deferring true power-off to `deep_after` means it happens only on absences long
+enough for a compensation cycle to actually complete.
+
+(Evidence caveat: LG documents this behaviour for their OLED **televisions**;
+the UltraGear monitor firmware is not confirmed to be identical. It is treated
+as strong suspicion, not established fact. Two independent reasons support the
+same split regardless: it sidesteps the DDC-wake reliability risk of §12 for
+the common case, and overlay restore is faster than DPMS wake.)
+
+`away_sample` governs both `Away` and `Deep`. A slower cadence in `Deep` was
+considered and rejected — face detection on a downscaled frame costs a few
+milliseconds, so the saving is negligible and does not justify another knob.
 
 ### 4.2 Sensor input
 
@@ -108,7 +133,7 @@ returned by the detector.
 
 ### 4.3 Miss streak
 
-A single `miss_streak_start: Option<Instant>` drives both reduction steps. It
+A single `miss_streak_start: Option<Instant>` drives all three reduction steps. It
 is set on the first `NoFace` and cleared by:
 
 - `face_confirm` (2) **consecutive** `Face` results — one isolated hit amid
@@ -118,37 +143,47 @@ is set on the first `NoFace` and cleared by:
   `Unknown` is biased toward the fail-safe (§4.7);
 - any input.
 
-`dim_after` and `away_after` are both measured from it, so `away_after` must be
-greater than `dim_after` (enforced at config load).
+`dim_after`, `away_after`, and `deep_after` are all measured from it, so they
+must be strictly increasing in that order (enforced at config load).
 
 ### 4.4 Transitions
 
 ```
-                     any input
-      +--------------------------------------------+
-      |                                            |
-  +---v----+  idle >= idle_grace  +----------+     |
-  | Active | -------------------> | Watching |     |
-  +---^----+   [open camera]      +----+-----+     |
-      |                                |           |
-      |                    streak >= dim_after     |
-      |                       [display -> dim]     |
-      |                                v           |
-      |                          +---------+       |
-      |                          | Dimmed  |-------+
-      |                          +----+----+       |
-      |                               |            |
-      |                  streak >= away_after      |
-      |                      [display -> off]      |
-      |                               v            |
-      |                          +--------+        |
-      +--------------------------|  Away  |--------+
-              [display -> full,  +--------+
-               close camera]
+                     any input, from any reduced state
+      +--------------------------------------------------+
+      |             [display -> full, close camera]       |
+      |                                                   |
+  +---v----+  idle >= idle_grace  +----------+            |
+  | Active | -------------------> | Watching |            |
+  +---^----+   [open camera]      +----+-----+            |
+      |                                |                  |
+      |                    streak >= dim_after            |
+      |                       [display -> dim]            |
+      |                                v                  |
+      |                          +---------+              |
+      |                          | Dimmed  |--------------+
+      |                          +----+----+              |
+      |                               |                   |
+      |                  streak >= away_after             |
+      |                     [display -> black]            |
+      |                               v                   |
+      |                          +--------+               |
+      |                          |  Away  |---------------+
+      |                          +---+----+               |
+      |                              |                    |
+      |                  streak >= deep_after             |
+      |                      [display -> off]             |
+      |                              v                    |
+      |                          +--------+               |
+      +--------------------------|  Deep  |---------------+
+                                 +--------+
 ```
 
-Restores upward (`Dimmed -> Watching`, `Away -> Watching`) are triggered by
-`wake_confirm` face hits **or** by any input. Input always wins immediately.
+Restores upward (`Dimmed`, `Away`, or `Deep` -> `Watching`) are triggered by
+`wake_confirm` face hits **or** by any input; input additionally closes the
+camera and returns to `Active`. Input always wins immediately. All three
+reduced states restore to `Full` in one step — there is no walking back up the
+ladder rung by rung.
 
 ### 4.5 Asymmetric thresholds
 
@@ -192,7 +227,12 @@ is retried every 5 minutes; a success returns to `Active`.
 ### 4.8 Effects
 
 ```rust
-enum DisplayLevel { Full, Dim(u8), Off }
+enum DisplayLevel {
+    Full,
+    Dim(u8),   // percent of the user's saved brightness
+    Black,     // pixels off, panel still powered
+    Off,       // panel powered down (DPMS)
+}
 
 enum Effect {
     OpenCamera,
@@ -217,7 +257,7 @@ testable with a fake clock and no hardware.
 | `Clock` | `Instant::now` | manual advance |
 | `IdleSource` | `GetLastInputInfo` | scripted durations |
 | `Camera` | WinRT `MediaCapture` + `FaceAnalysis` | scripted `FaceResult`s |
-| `DisplayControl` | tiered chain (§6) | recording spy |
+| `DisplayControl` | per-operation resolver (§6) | recording spy |
 
 ### 5.1 Vision
 
@@ -246,47 +286,68 @@ looking.
 ## 6. Display control
 
 At startup VISOR enumerates monitors (`EnumDisplayMonitors` ->
-`GetPhysicalMonitorsFromHMONITOR`) and probes each configured target with
-`GetVCPFeature(0xD6)`. Each monitor is pinned to the best tier that answered.
+`GetPhysicalMonitorsFromHMONITOR`), probes each configured target with
+`GetVCPFeature(0xD6)` and `GetVCPFeature(0x10)`, and saves the user's current
+brightness so restores return their own level rather than a guess.
 
-**Tier 1 — DDC/CI.** Talks to the panel over its own control channel.
+### 6.1 Mechanism is chosen per operation, not per monitor
 
-- `Full`: `SetVCPFeature(0xD6, 1)`, then `SetVCPFeature(0x10, saved_brightness)`
-- `Dim(p)`: `SetVCPFeature(0x10, p% of saved_brightness)`
-- `Off`: `SetVCPFeature(0xD6, 4)`
+A monitor is **not** pinned to a single tier. Each of the four display levels
+resolves its own mechanism independently, because a panel can support one and
+not another — and can change its mind at runtime.
 
-Brightness (VCP `0x10`) is read once at startup and saved, so restores return
-the panel to the user's own level rather than a guess.
+The case that forces this: **Windows locks DDC/CI brightness while HDR is on.**
+`SetVCPFeature(0x10, ...)` silently does nothing, which on an HDR gaming OLED
+would mean the entire `Dimmed` state quietly never happens. Meanwhile
+`SetVCPFeature(0xD6, ...)` power control keeps working. Per-monitor tiering
+cannot express that; per-operation resolution can.
 
-**Value 4 is used for off, never value 5.** Value 5 is a hard power-off that
-many panels cannot be woken from over DDC.
+| Level | Preferred | Fallback |
+|---|---|---|
+| `Dim(p)` | DDC `0x10` = `p%` of saved, **verified by readback** | layered overlay, alpha `100 - p` |
+| `Black` | opaque overlay | — (always available) |
+| `Off` | DDC `0xD6` = `4` | opaque overlay (degrades to `Black`), then broadcast |
+| `Full` | undo whatever is applied | — |
 
-**Tier 2 — black overlay.** A borderless topmost
-`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` window sized to the monitor's rect,
-created on the message-pump thread.
+**The readback is the whole mechanism.** After writing `0x10`, VISOR reads it
+back; if the value did not take, it falls through to the overlay for that
+application and remembers the result. Doing this on *every* dim rather than once
+at startup means toggling HDR mid-session simply works, with no HDR-detection
+code anywhere in the codebase.
 
-- `Full`: destroy the window
-- `Dim(p)`: layered window, alpha proportional to `100 - p`
-- `Off`: opaque black
+**`Black` deliberately does not use DDC at all.** It is the short-absence
+workhorse, so it must not power-cycle the panel (§4.1) and must restore
+instantly.
 
-On OLED, black pixels are genuinely off, so this recovers most of the power and
-burn-in benefit without any hardware dependency.
+**`Off` uses VCP value 4, never value 5.** Value 5 is a hard power-off many
+panels cannot be woken from over DDC.
 
-**Tier 3 — blank-all broadcast.** `SC_MONITORPOWER`, global and blunt.
+**Broadcast is quarantined.** `SC_MONITORPOWER` blanks *every* display, so it
+is only ever used when a monitor supports nothing else **and** either it is the
+only display attached or the user has explicitly set `strategy = "broadcast"`.
+It is never chosen automatically in a multi-monitor setup, where it would blank
+panels VISOR was told to leave alone.
 
-- `Full`: broadcast `-1`
-- `Dim(p)`: unsupported — no-op, panel stays full
-- `Off`: broadcast `2`
+### 6.2 Restoring to `Full`
 
-Monitors on this tier skip `Dimmed` entirely and step straight from `Watching`
-to `Away`.
+Order matters, because a panel that has just come out of DPMS will reject DDC
+traffic for a moment:
 
-**Degradation.** A runtime failure demotes that monitor one tier and logs once,
-so a panel that turns flaky mid-session degrades rather than breaking.
+1. Destroy any overlay window (instant, and the only step needed from `Black`).
+2. If the panel was `Off`: `SetVCPFeature(0xD6, 1)`, plus a `SC_MONITORPOWER -1`
+   broadcast as belt-and-braces — a panel that ignores DDC-wake is the one
+   failure a user cannot work around themselves.
+3. Restore brightness with `SetVCPFeature(0x10, saved)`, retried with backoff
+   for up to 2s, since the panel may not accept it immediately after waking.
+   Skipped entirely if the dim was done by overlay, in which case step 1
+   already restored it.
 
-**Wake belt-and-braces.** When restoring a DDC monitor to `Full`, VISOR also
-issues a `SC_MONITORPOWER -1` broadcast. A stubborn panel ignoring DDC-wake is
-the one failure mode a user cannot work around themselves.
+### 6.3 Degradation
+
+A runtime failure demotes that *operation* on that monitor to its fallback and
+logs once, so a panel that turns flaky mid-session degrades rather than
+breaking. Mechanism choices are re-probed on `WM_DISPLAYCHANGE` and on system
+resume.
 
 ## 7. Configuration
 
@@ -298,8 +359,9 @@ reloaded from a tray menu item. No file watcher.
 idle_grace      = "30s"   # input idle before the camera opens
 sample_interval = "2s"    # frame cadence in Watching / Dimmed
 dim_after       = "20s"   # no-face streak before dimming
-away_after      = "45s"   # no-face streak before powering off
-away_sample     = "1s"    # frame cadence in Away — governs wake latency
+away_after      = "45s"   # no-face streak before going black (panel stays on)
+deep_after      = "15m"   # no-face streak before true power-off
+away_sample     = "1s"    # frame cadence in Away/Deep — governs wake latency
 face_confirm    = 2       # consecutive hits to stay awake
 wake_confirm    = 1       # hits to restore from Dimmed or Away
 wake_probation  = "10s"   # camera-only restore must be confirmed within this
@@ -318,7 +380,8 @@ hold_awake_while_present = false
 level = "info"
 ```
 
-Standing up dims the panel at roughly 50s and blacks it at roughly 75s.
+Standing up dims the panel at roughly 50s, blacks it at roughly 75s, and powers
+it down after about 15 minutes.
 
 `hold_awake_while_present` asserts `SetThreadExecutionState(ES_DISPLAY_REQUIRED)`
 while the user is present, making VISOR the single authority on when the screen
@@ -327,9 +390,10 @@ is on and allowing the Windows timeout to be set very short as a safety net.
 hardware, a false positive would mean a screen that never sleeps — exactly
 backwards for a panel we are trying to protect. Revisit after real use.
 
-Validation at load: `away_after > dim_after`, all durations positive,
-`min_face_ratio` in `(0, 1)`, `dim_level` in `1..=99`. A config that fails
-validation falls back to defaults and logs loudly rather than refusing to start.
+Validation at load: `dim_after < away_after < deep_after`, all durations
+positive, `min_face_ratio` in `(0, 1)`, `dim_level` in `1..=99`. A config that
+fails validation falls back to defaults and logs loudly rather than refusing to
+start.
 
 ## 8. Failure handling
 
@@ -338,8 +402,9 @@ validation falls back to defaults and logs loudly rather than refusing to start.
 | Camera open fails | `Unknown`; 3 consecutive -> `Degraded` |
 | Detector error | `Unknown`; same escalation |
 | Config parse/validation error | Defaults, log at `error`, keep running |
-| DDC call fails | Demote that monitor one tier, log once |
-| All display tiers fail | Log once, remain in current state |
+| DDC dim write does not read back | Fall through to overlay dim, log once |
+| DDC power call fails | Demote that operation to overlay, log once |
+| All mechanisms for a level fail | Log once, remain in current state |
 | Monitor hot-unplug | Re-enumerate and re-probe on `WM_DISPLAYCHANGE` |
 | System resume | Re-probe DDC; assume `Active` |
 
@@ -351,16 +416,22 @@ transition, plus specifically: `Unknown` never causing a step down; hysteresis
 absorbing a single dropped frame; a miss streak reset by one late hit; wake
 probation expiring back to `Away`; wake probation cleared by a second hit;
 `min_face_ratio` downgrading a distant face; `Degraded` restoring the display
-from `Away`; pause and resume from every state.
+from `Deep`; the full ladder `Watching -> Dimmed -> Away -> Deep` on one
+unbroken streak; restore to `Full` in a single step from each of the three
+reduced states; pause and resume from every state.
 
 **Integration — Windows adapters.** `#[ignore]` by default, run on demand
-against real hardware since they cannot run in CI: DDC probe/sleep/wake
-round-trip, brightness save/restore, monitor enumeration, camera open/close.
+against real hardware since they cannot run in CI: DDC probe/off/wake
+round-trip, brightness save/restore, the `0x10` readback correctly reporting
+failure with HDR on, mechanism resolution picking overlay-dim under HDR while
+keeping DDC-off, monitor enumeration, camera open/close.
 
 **Manual smoke checklist.** Walk away and return. Walk away with a video
 playing. Sit down without touching input. Have someone walk past behind the
 chair. Unplug the webcam mid-session. Sleep and resume the machine. Unplug a
-monitor while dimmed.
+monitor while dimmed. **Toggle Windows HDR on and off while dimmed** — the dim
+must survive the transition by switching mechanism. Leave for 15+ minutes and
+confirm the panel actually powers down and comes back.
 
 ## 10. Layout
 
@@ -382,7 +453,7 @@ VISOR/
    │  ├─ idle.rs        GetLastInputInfo
    │  └─ camera.rs      MediaCapture + FaceAnalysis
    ├─ actions/
-   │  ├─ mod.rs         DisplayControl trait + tiered chain
+   │  ├─ mod.rs         DisplayControl trait + resolver
    │  ├─ ddc.rs
    │  ├─ overlay.rs
    │  └─ broadcast.rs
@@ -402,17 +473,28 @@ milestone 1).
 3. **Idle + engine loop** — correct transitions with a stub camera. First point
    the behaviour is observable in the log.
 4. **Camera + face detection** — real presence.
-5. **Display chain** — DDC first, then overlay, then broadcast. First point
-   VISOR does the thing it exists for.
+5. **Display control** — overlay first (it is the `Black` workhorse and has no
+   hardware dependency, so it makes VISOR useful on any monitor immediately),
+   then DDC for `Dim` and `Off`, then the quarantined broadcast fallback. First
+   point VISOR does the thing it exists for.
 6. **Polish** — `Degraded`, tray status, first-run defaults,
    `WM_DISPLAYCHANGE` handling.
 
 ## 12. Known risks
 
 **DDC/CI wake reliability varies by panel and cannot be predicted from here.**
-Milestone 5 opens with a throwaway probe against the actual monitor before
-committing to DDC as the primary tier. If it cannot be woken reliably, the
-overlay tier is promoted to default and DDC becomes opt-in.
+Largely defused by the `Away`/`Deep` split — DDC power-off now only happens on
+long absences, and the common case never leaves the overlay. Milestone 5 still
+opens with a throwaway probe against the real monitor; if it cannot be woken
+reliably, `Deep` is disabled by setting `deep_after` to infinity and VISOR
+still delivers everything except the last few watts.
+
+**The reference hardware is an LG UltraGear OLED (GX7).** Two of its
+characteristics shaped the design and should be re-checked on other panels:
+DDC brightness is locked while Windows HDR is on (handled by the readback in
+§6.1), and pixel-cleaning cycles run while powered off (handled by the
+`Away`/`Deep` split in §4.1). Neither assumption is load-bearing — a panel that
+behaves differently simply resolves to different mechanisms.
 
 **`FaceAnalysis` is frontal-only** and may lose the user at a sharp angle. First
 remedy is raising `away_after`; escape hatch is an ONNX detector behind the
