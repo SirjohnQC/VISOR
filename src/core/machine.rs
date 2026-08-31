@@ -2,12 +2,21 @@ use crate::config::PresenceConfig;
 use crate::core::types::{DisplayLevel, Effect, FaceResult, State};
 use std::time::{Duration, Instant};
 
+/// Spec §4.6 — a camera-triggered restore holds probation until confirmed
+/// or expired. `fallback` is the rung the machine returns to on expiry.
+#[derive(Debug, Clone, Copy)]
+struct Probation {
+    since: Instant,
+    fallback: State,
+}
+
 pub struct Machine {
     cfg: PresenceConfig,
     dim_level: u8,
     state: State,
     miss_streak_start: Option<Instant>,
     face_run: u8,
+    probation: Option<Probation>,
 }
 
 impl Machine {
@@ -18,6 +27,7 @@ impl Machine {
             state: State::Active,
             miss_streak_start: None,
             face_run: 0,
+            probation: None,
         }
     }
 
@@ -111,6 +121,7 @@ impl Machine {
                 self.state = State::Active;
                 self.miss_streak_start = None;
                 self.face_run = 0;
+                self.probation = None;
                 fx.push(Effect::SetDisplay(DisplayLevel::Full));
                 fx.push(Effect::CloseCamera);
             }
@@ -121,16 +132,48 @@ impl Machine {
             self.state = State::Watching;
             self.miss_streak_start = None;
             self.face_run = 0;
+            self.probation = None;
             fx.push(Effect::OpenCamera);
             fx.push(Effect::SetSampleInterval(self.cfg.sample_interval));
             return (self.state, fx);
         }
 
         self.update_streak(face, now);
+
+        // Spec §4.6 — a camera-triggered restore is on probation until a
+        // second hit confirms it.
+        if let Some(p) = self.probation {
+            let confirmed = self.face_run >= self.cfg.face_confirm;
+            if confirmed {
+                self.probation = None;
+            } else if now.saturating_duration_since(p.since) >= self.cfg.wake_probation {
+                self.probation = None;
+                self.state = p.fallback;
+                return (self.state, self.effects_for_rung(p.fallback));
+            } else {
+                return (self.state, fx);
+            }
+        }
+
+        let reduced = matches!(self.state, State::Dimmed | State::Away | State::Deep);
+        let waking =
+            matches!(face, FaceResult::Face { .. }) && self.face_run >= self.cfg.wake_confirm;
+
+        // Spec §4.5 — restore to Full in a single step from any rung.
+        if reduced && waking {
+            self.probation = Some(Probation {
+                since: now,
+                fallback: self.state,
+            });
+            self.state = State::Watching;
+            fx.push(Effect::SetDisplay(DisplayLevel::Full));
+            fx.push(Effect::SetSampleInterval(self.cfg.sample_interval));
+            return (self.state, fx);
+        }
+
+        // Ladder fall-through — downward-only, per ruling F3 (Task 3). Do NOT
+        // replace this with `if rung != self.state`.
         let rung = self.rung_for(self.streak_for(now));
-        // Ruling F3 / spec §4.4, §4.7 — the ladder is downward-only. A cleared
-        // streak (which a single Unknown causes) must never re-light the panel;
-        // only the explicit restore path or returning input moves us back up.
         let deeper = match (Self::rung_ordinal(self.state), Self::rung_ordinal(rung)) {
             (Some(current), Some(next)) => next > current,
             _ => false,
@@ -403,5 +446,200 @@ mod tests {
             fx.is_empty(),
             "no display effect may be emitted for an Unknown"
         );
+    }
+
+    /// Drive the machine down to a given rung and return the base instant.
+    fn into_rung(m: &mut Machine, rung: State) -> Instant {
+        let t0 = into_watching(m);
+        let secs: u64 = match rung {
+            State::Dimmed => 21,
+            State::Away => 46,
+            State::Deep => 901,
+            other => panic!("not a rung: {other:?}"),
+        };
+        m.step(
+            Duration::from_secs(31),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(1),
+        );
+        m.step(
+            Duration::from_secs(31 + secs),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(secs),
+        );
+        assert_eq!(m.state(), rung);
+        t0
+    }
+
+    #[test]
+    fn one_face_hit_restores_to_full_from_every_rung() {
+        for rung in [State::Dimmed, State::Away, State::Deep] {
+            let mut m = machine();
+            let t0 = into_rung(&mut m, rung);
+            let (s, fx) = m.step(
+                Duration::from_secs(999),
+                PRESENT,
+                t0 + Duration::from_secs(902),
+            );
+            assert_eq!(s, State::Watching, "restored from {rung:?}");
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::SetDisplay(DisplayLevel::Full),
+                    Effect::SetSampleInterval(Duration::from_secs(2)),
+                ],
+                "restored from {rung:?} in one step"
+            );
+        }
+    }
+
+    #[test]
+    fn probation_expires_back_to_the_rung_it_came_from() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+
+        // camera-triggered restore
+        let (s, _) = m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(47),
+        );
+        assert_eq!(s, State::Watching);
+
+        // 10s later with nothing confirming it — back to Away
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(58),
+        );
+        assert_eq!(s, State::Away);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetDisplay(DisplayLevel::Black),
+                Effect::SetSampleInterval(Duration::from_secs(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_hit_confirms_probation() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+
+        m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(47),
+        );
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(49),
+        );
+        assert_eq!(s, State::Watching);
+        assert!(fx.is_empty());
+
+        // well past wake_probation — still awake, because it was confirmed
+        let (s, _) = m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(70),
+        );
+        assert_eq!(s, State::Watching);
+    }
+
+    #[test]
+    fn probation_preserves_the_miss_streak() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+
+        // spurious wake at +47s, expires at +58s
+        m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(47),
+        );
+        let (s, _) = m.step(
+            Duration::from_secs(999),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(58),
+        );
+        assert_eq!(s, State::Away);
+
+        // The original streak began at t0+1. deep_after is 15m, so Deep is due
+        // at t0+901 — NOT 15m after the spurious wake.
+        let (s, _) = m.step(
+            Duration::from_secs(999),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(902),
+        );
+        assert_eq!(s, State::Deep, "streak resumed rather than restarting");
+    }
+
+    /// Carried over from the Task 3 review: no existing test distinguishes
+    /// "2 consecutive hits" from "2 hits ever". Deleting `self.face_run = 0;`
+    /// from update_streak's NoFace arm currently survives the whole suite.
+    #[test]
+    fn non_consecutive_face_hits_do_not_clear_the_streak() {
+        let mut m = machine();
+        let t0 = into_watching(&mut m);
+
+        // Face, NoFace, Face — two hits in total, but never two in a row.
+        m.step(
+            Duration::from_secs(31),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(1),
+        );
+        m.step(
+            Duration::from_secs(33),
+            PRESENT,
+            t0 + Duration::from_secs(3),
+        );
+        m.step(
+            Duration::from_secs(35),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(5),
+        );
+        m.step(
+            Duration::from_secs(37),
+            PRESENT,
+            t0 + Duration::from_secs(7),
+        );
+        let (s, _) = m.step(
+            Duration::from_secs(51),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(21),
+        );
+        assert_eq!(
+            s,
+            State::Dimmed,
+            "face_confirm is consecutive, not cumulative"
+        );
+    }
+
+    #[test]
+    fn input_triggered_restore_never_enters_probation() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+
+        let (s, fx) = m.step(
+            Duration::ZERO,
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(47),
+        );
+        assert_eq!(s, State::Active);
+        assert_eq!(
+            fx,
+            vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera]
+        );
+
+        // long past wake_probation, still Active — no probation to expire
+        let (s, _) = m.step(
+            Duration::ZERO,
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(120),
+        );
+        assert_eq!(s, State::Active);
     }
 }
