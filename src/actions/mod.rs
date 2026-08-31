@@ -1,6 +1,7 @@
 use crate::core::types::DisplayLevel;
 use std::sync::{Arc, Mutex};
 
+pub mod ddc;
 pub mod monitors;
 pub mod overlay;
 
