@@ -105,6 +105,16 @@ impl Engine {
         }
     }
 
+    /// Spec §2.1 — the process must never exit with the screen dark. Goes
+    /// through `apply` so the shutdown transition is logged like every other
+    /// one and the camera-close guard is not duplicated.
+    fn shutdown(&mut self, state: State) {
+        self.apply(
+            vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera],
+            state,
+        );
+    }
+
     /// Blocking loop. Returns when a `Quit` command arrives or the channel
     /// closes.
     pub fn run(mut self, rx: Receiver<Command>, status: Arc<AtomicU8>) {
@@ -114,11 +124,7 @@ impl Engine {
 
             match rx.recv_timeout(self.cadence) {
                 Ok(Command::Quit) => {
-                    // Always leave the screen on when exiting (spec §2.1).
-                    self.display.apply(DisplayLevel::Full);
-                    if self.camera_open {
-                        self.camera.close();
-                    }
+                    self.shutdown(state);
                     return;
                 }
                 Ok(cmd) => {
@@ -127,7 +133,14 @@ impl Engine {
                     status.store(state.as_u8(), Ordering::Relaxed);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => {
+                    // The command channel is gone — whoever owned the Sender
+                    // died or dropped it. Exiting is right, but exiting with a
+                    // black screen is the one outcome spec §2.1 forbids, so
+                    // this path restores the display exactly like Quit does.
+                    self.shutdown(state);
+                    return;
+                }
             }
         }
     }
@@ -140,6 +153,111 @@ mod tests {
     use crate::sense::camera::FakeCamera;
     use crate::sense::idle::FakeIdle;
     use std::sync::Arc;
+
+    #[test]
+    fn the_state_byte_round_trips_for_every_state() {
+        for s in [
+            State::Active,
+            State::Watching,
+            State::Dimmed,
+            State::Away,
+            State::Deep,
+            State::Paused,
+            State::Degraded,
+        ] {
+            assert_eq!(State::from_u8(s.as_u8()), s, "round trip failed for {s:?}");
+        }
+        // Anything the tray could not have written maps to the safest row:
+        // camera closed, display full.
+        assert_eq!(State::from_u8(200), State::Active);
+    }
+
+    #[test]
+    fn entering_a_rung_updates_the_tick_cadence() {
+        let idle = Arc::new(FakeIdle::new(Duration::ZERO));
+        let mut engine = Engine::new(
+            Config::default(),
+            idle.clone(),
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 64])),
+            Box::new(SpyDisplay::new()),
+        );
+        let t0 = Instant::now();
+
+        // `cadence` seeds at 1s and is only ever changed by SetSampleInterval.
+        assert_eq!(engine.cadence, Duration::from_secs(1));
+
+        idle.set(Duration::from_secs(30));
+        engine.tick(t0 + Duration::from_secs(30)); // -> Watching
+        assert_eq!(
+            engine.cadence,
+            Duration::from_secs(2),
+            "Watching must adopt sample_interval"
+        );
+
+        engine.tick(t0 + Duration::from_secs(31)); // streak starts
+        engine.tick(t0 + Duration::from_secs(52)); // -> Dimmed
+        engine.tick(t0 + Duration::from_secs(76)); // -> Away
+        assert_eq!(engine.state(), State::Away);
+        assert_eq!(
+            engine.cadence,
+            Duration::from_secs(1),
+            "Away must adopt away_sample"
+        );
+    }
+
+    #[test]
+    fn quit_restores_the_display_and_reports_the_last_state() {
+        let idle = Arc::new(FakeIdle::new(Duration::from_secs(30)));
+        let display = SpyDisplay::new();
+        let seen = display.log();
+        let engine = Engine::new(
+            Config::default(),
+            idle,
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 8])),
+            Box::new(display),
+        );
+        let status = Arc::new(AtomicU8::new(255));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Command::Quit).unwrap();
+        engine.run(rx, status.clone());
+
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&DisplayLevel::Full),
+            "spec §2.1: never exit with the screen dark"
+        );
+        assert_eq!(
+            State::from_u8(status.load(Ordering::Relaxed)),
+            State::Watching,
+            "status reflects the tick that ran before Quit"
+        );
+    }
+
+    #[test]
+    fn a_dropped_sender_also_restores_the_display() {
+        // Regression: the Disconnected arm used to `return` without restoring,
+        // so a tray that died mid-run would leave the panel black on exit.
+        let idle = Arc::new(FakeIdle::new(Duration::from_secs(30)));
+        let display = SpyDisplay::new();
+        let seen = display.log();
+        let engine = Engine::new(
+            Config::default(),
+            idle,
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 8])),
+            Box::new(display),
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<Command>();
+        drop(tx);
+        engine.run(rx, Arc::new(AtomicU8::new(0)));
+
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&DisplayLevel::Full),
+            "a dropped Sender must not strand the screen dark"
+        );
+    }
 
     #[test]
     fn the_engine_drives_the_full_ladder_and_records_display_changes() {
