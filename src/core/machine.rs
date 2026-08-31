@@ -1,6 +1,9 @@
 use crate::config::PresenceConfig;
-use crate::core::types::{DisplayLevel, Effect, FaceResult, State};
+use crate::core::types::{Command, DisplayLevel, Effect, FaceResult, State};
 use std::time::{Duration, Instant};
+
+/// Spec §4.7 — Degraded retries the camera every 5 minutes.
+const DEGRADED_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Spec §4.6 — a camera-triggered restore holds probation until confirmed
 /// or expired. `fallback` is the rung the machine returns to on expiry.
@@ -17,6 +20,19 @@ pub struct Machine {
     miss_streak_start: Option<Instant>,
     face_run: u8,
     probation: Option<Probation>,
+    unknown_run: u8,
+    /// When the current unrelieved run of `Unknown`s began. The 5-minute
+    /// `Degraded` retry timer is measured from here (the first failure),
+    /// not from the tick that actually crosses the threshold and flips the
+    /// state — mirroring how `miss_streak_start` is measured from the first
+    /// miss rather than from the tick a rung boundary is crossed.
+    unknown_streak_start: Option<Instant>,
+    degraded_since: Option<Instant>,
+    /// Spec §7 `hold_awake_while_present`. Off by default.
+    awake_hold: bool,
+    /// Last value of `SetAwakeHold` actually emitted, so the effect is only
+    /// re-emitted on change (ruling F5(b)).
+    awake_hold_asserted: bool,
 }
 
 impl Machine {
@@ -28,11 +44,68 @@ impl Machine {
             miss_streak_start: None,
             face_run: 0,
             probation: None,
+            unknown_run: 0,
+            unknown_streak_start: None,
+            degraded_since: None,
+            awake_hold: false,
+            awake_hold_asserted: false,
         }
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Enable spec §7 hold_awake_while_present.
+    pub fn set_awake_hold(&mut self, enabled: bool) {
+        self.awake_hold = enabled;
+    }
+
+    /// Spec §7 — `SetAwakeHold` is emitted only when the presence-derived
+    /// value actually changes, never on every tick (ruling F5(b)); otherwise
+    /// it would break the `assert!(fx.is_empty())` tests from Tasks 2-4
+    /// whenever the hold is enabled.
+    fn awake_hold_effect(&mut self, new_state: State) -> Option<Effect> {
+        if !self.awake_hold {
+            return None;
+        }
+        let present = matches!(new_state, State::Active | State::Watching);
+        if present == self.awake_hold_asserted {
+            return None;
+        }
+        self.awake_hold_asserted = present;
+        Some(Effect::SetAwakeHold(present))
+    }
+
+    fn recover_from_fault(&mut self) -> Vec<Effect> {
+        self.state = State::Active;
+        self.miss_streak_start = None;
+        self.face_run = 0;
+        self.unknown_run = 0;
+        self.unknown_streak_start = None;
+        self.probation = None;
+        self.degraded_since = None;
+        Vec::new()
+    }
+
+    pub fn command(&mut self, cmd: Command, _now: Instant) -> (State, Vec<Effect>) {
+        match cmd {
+            Command::Pause if self.state != State::Paused => {
+                self.state = State::Paused;
+                self.miss_streak_start = None;
+                self.face_run = 0;
+                self.probation = None;
+                (
+                    self.state,
+                    vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera],
+                )
+            }
+            Command::Resume if self.state == State::Paused => {
+                self.state = State::Active;
+                (self.state, Vec::new())
+            }
+            _ => (self.state, Vec::new()),
+        }
     }
 
     /// Spec §4.2 — a face smaller than `min_face_ratio` is not presence.
@@ -112,6 +185,31 @@ impl Machine {
     }
 
     pub fn step(&mut self, idle: Duration, face: FaceResult, now: Instant) -> (State, Vec<Effect>) {
+        if self.state == State::Paused {
+            return (self.state, Vec::new());
+        }
+
+        if self.state == State::Degraded {
+            // Spec §4.7 — the camera is retried every 5 minutes; a
+            // non-Unknown result on a due retry returns to Active.
+            //
+            // Ruling: this check sits ahead of the `input_active` and
+            // `state == State::Active` blocks below, so returning input does
+            // NOT itself lift Degraded. That is intentional: input does not
+            // repair a broken camera, and Degraded has already restored the
+            // display to full and closed the camera, so there is nothing for
+            // input to fix.
+            let due = self
+                .degraded_since
+                .map(|s| now.saturating_duration_since(s) >= DEGRADED_RETRY)
+                .unwrap_or(true);
+            if due && !matches!(face, FaceResult::Unknown) {
+                let fx = self.recover_from_fault();
+                return (self.state, fx);
+            }
+            return (self.state, Vec::new());
+        }
+
         let face = self.normalise(face);
         let input_active = idle < self.cfg.idle_grace;
         let mut fx = Vec::new();
@@ -125,6 +223,9 @@ impl Machine {
                 fx.push(Effect::SetDisplay(DisplayLevel::Full));
                 fx.push(Effect::CloseCamera);
             }
+            if let Some(e) = self.awake_hold_effect(self.state) {
+                fx.push(e);
+            }
             return (self.state, fx);
         }
 
@@ -135,7 +236,41 @@ impl Machine {
             self.probation = None;
             fx.push(Effect::OpenCamera);
             fx.push(Effect::SetSampleInterval(self.cfg.sample_interval));
+            if let Some(e) = self.awake_hold_effect(self.state) {
+                fx.push(e);
+            }
             return (self.state, fx);
+        }
+
+        // Spec §4.7 — three consecutive Unknowns mean we can no longer tell.
+        // Leaving the screen dark would be the harmful outcome.
+        // Ruling F4: this must sit below the Active early-return above. A
+        // closed camera (the common case, in Active) reports Unknown by
+        // design, and counting those ticks would degrade every run by its
+        // third tick. Placing it here means unknown_run only accumulates
+        // while the camera is genuinely open (Watching/Dimmed/Away/Deep).
+        if matches!(face, FaceResult::Unknown) {
+            if self.unknown_run == 0 {
+                self.unknown_streak_start = Some(now);
+            }
+            self.unknown_run = self.unknown_run.saturating_add(1);
+            if self.unknown_run >= 3 {
+                self.state = State::Degraded;
+                // The 5-minute retry timer starts from the first Unknown of
+                // this run, not from this tick — the same "measured from the
+                // first miss" convention `miss_streak_start` already uses.
+                self.degraded_since = self.unknown_streak_start;
+                self.probation = None;
+                self.miss_streak_start = None;
+                let mut fx = vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera];
+                if let Some(e) = self.awake_hold_effect(self.state) {
+                    fx.push(e);
+                }
+                return (self.state, fx);
+            }
+        } else {
+            self.unknown_run = 0;
+            self.unknown_streak_start = None;
         }
 
         self.update_streak(face, now);
@@ -149,8 +284,15 @@ impl Machine {
             } else if now.saturating_duration_since(p.since) >= self.cfg.wake_probation {
                 self.probation = None;
                 self.state = p.fallback;
-                return (self.state, self.effects_for_rung(p.fallback));
+                let mut fx = self.effects_for_rung(p.fallback);
+                if let Some(e) = self.awake_hold_effect(self.state) {
+                    fx.push(e);
+                }
+                return (self.state, fx);
             } else {
+                if let Some(e) = self.awake_hold_effect(self.state) {
+                    fx.push(e);
+                }
                 return (self.state, fx);
             }
         }
@@ -168,6 +310,9 @@ impl Machine {
             self.state = State::Watching;
             fx.push(Effect::SetDisplay(DisplayLevel::Full));
             fx.push(Effect::SetSampleInterval(self.cfg.sample_interval));
+            if let Some(e) = self.awake_hold_effect(self.state) {
+                fx.push(e);
+            }
             return (self.state, fx);
         }
 
@@ -181,6 +326,9 @@ impl Machine {
         if deeper {
             self.state = rung;
             fx.extend(self.effects_for_rung(rung));
+        }
+        if let Some(e) = self.awake_hold_effect(self.state) {
+            fx.push(e);
         }
         (self.state, fx)
     }
@@ -641,5 +789,165 @@ mod tests {
             t0 + Duration::from_secs(120),
         );
         assert_eq!(s, State::Active);
+    }
+
+    use crate::core::types::Command;
+
+    #[test]
+    fn three_consecutive_unknowns_degrade_and_restore_the_display() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Deep);
+
+        m.step(
+            Duration::from_secs(999),
+            FaceResult::Unknown,
+            t0 + Duration::from_secs(902),
+        );
+        m.step(
+            Duration::from_secs(999),
+            FaceResult::Unknown,
+            t0 + Duration::from_secs(903),
+        );
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            FaceResult::Unknown,
+            t0 + Duration::from_secs(904),
+        );
+
+        assert_eq!(s, State::Degraded);
+        assert_eq!(
+            fx,
+            vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera]
+        );
+    }
+
+    #[test]
+    fn a_successful_probe_run_recovers_from_degraded() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+        for i in 0..3 {
+            m.step(
+                Duration::from_secs(999),
+                FaceResult::Unknown,
+                t0 + Duration::from_secs(902 + i),
+            );
+        }
+        assert_eq!(m.state(), State::Degraded);
+
+        // retry_after elapses and the camera works again
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(902 + 5 * 60),
+        );
+        assert_eq!(s, State::Active);
+        assert!(
+            fx.is_empty(),
+            "Active is already Full with the camera closed"
+        );
+    }
+
+    #[test]
+    fn degraded_ignores_faces_until_the_retry_window_elapses() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+        for i in 0..3 {
+            m.step(
+                Duration::from_secs(999),
+                FaceResult::Unknown,
+                t0 + Duration::from_secs(902 + i),
+            );
+        }
+        let (s, _) = m.step(
+            Duration::from_secs(999),
+            PRESENT,
+            t0 + Duration::from_secs(910),
+        );
+        assert_eq!(s, State::Degraded);
+    }
+
+    #[test]
+    fn pause_restores_the_display_and_resume_returns_to_active() {
+        let mut m = machine();
+        let t0 = into_rung(&mut m, State::Away);
+
+        let (s, fx) = m.command(Command::Pause, t0 + Duration::from_secs(50));
+        assert_eq!(s, State::Paused);
+        assert_eq!(
+            fx,
+            vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera]
+        );
+
+        // steps do nothing while paused
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(999),
+        );
+        assert_eq!(s, State::Paused);
+        assert!(fx.is_empty());
+
+        let (s, fx) = m.command(Command::Resume, t0 + Duration::from_secs(1000));
+        assert_eq!(s, State::Active);
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn a_closed_camera_reporting_unknown_never_degrades() {
+        let mut m = machine();
+        let t0 = Instant::now();
+        // Active, camera closed, engine feeds Unknown every tick for a long while.
+        for i in 0..10 {
+            let (s, fx) = m.step(
+                Duration::from_secs(1),
+                FaceResult::Unknown,
+                t0 + Duration::from_secs(i),
+            );
+            assert_eq!(s, State::Active, "tick {i} must stay Active");
+            assert!(fx.is_empty(), "tick {i} must produce no effects");
+        }
+    }
+
+    #[test]
+    fn awake_hold_is_emitted_only_when_enabled() {
+        let mut m = machine();
+        let t0 = Instant::now();
+        m.set_awake_hold(true);
+
+        // Active -> Watching. Camera opens; hold is asserted.
+        let (s, fx) = m.step(Duration::from_secs(30), FaceResult::Unknown, t0);
+        assert_eq!(s, State::Watching);
+        assert!(
+            fx.contains(&Effect::SetAwakeHold(true)),
+            "hold asserted on entering Watching"
+        );
+
+        // First NoFace after opening: this is the tick that STARTS the miss streak.
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(
+            s,
+            State::Watching,
+            "streak has just started, nothing steps down yet"
+        );
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::SetAwakeHold(_))),
+            "hold value is unchanged, so nothing is re-emitted"
+        );
+
+        // dim_after (20s) has now elapsed since the streak started at t0+2.
+        let (s, fx) = m.step(
+            Duration::from_secs(999),
+            FaceResult::NoFace,
+            t0 + Duration::from_secs(23),
+        );
+        assert_eq!(s, State::Dimmed);
+        assert!(
+            fx.contains(&Effect::SetAwakeHold(false)),
+            "hold released on stepping down"
+        );
     }
 }
