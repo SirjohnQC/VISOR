@@ -1,8 +1,9 @@
-use crate::core::types::{Command, State};
+use crate::actions::Resolver;
+use crate::core::types::{Command, DisplayLevel, State};
 use crate::error::{Result, VisorError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -50,7 +51,16 @@ fn solid_icon(rgb: [u8; 3]) -> std::result::Result<Icon, tray_icon::BadIcon> {
 }
 
 /// Owns the Win32 message pump. Blocks until the user quits.
-pub fn run(tx: Sender<Command>, status: Arc<AtomicU8>) -> Result<()> {
+///
+/// Ruling F8: this thread also owns the `Resolver`, because overlay windows
+/// must belong to the pumping thread and `DdcMonitor` is not `Send`. The engine
+/// sends `DisplayLevel`s down `levels` and this loop applies them.
+pub fn run(
+    tx: Sender<Command>,
+    status: Arc<AtomicU8>,
+    levels: Receiver<DisplayLevel>,
+    resolver: &mut Resolver,
+) -> Result<()> {
     let win = |e: tray_icon::BadIcon| VisorError::Windows(e.to_string());
     // Slate for normal operation, amber for the Degraded warning.
     let normal = solid_icon([0x3A, 0x6E, 0xA5]).map_err(win)?;
@@ -107,6 +117,14 @@ pub fn run(tx: Sender<Command>, status: Arc<AtomicU8>) -> Result<()> {
                     return Ok(());
                 }
             }
+        }
+
+        // Apply whatever the engine asked for since the last iteration.
+        // DDC VCP calls block for tens to hundreds of ms, so this is the one
+        // place the pump can stall; at a 250ms poll the only visible cost is
+        // tooltip latency.
+        while let Ok(level) = levels.try_recv() {
+            resolver.apply(level);
         }
 
         let current = State::from_u8(status.load(Ordering::Relaxed));
