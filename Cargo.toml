@@ -33,9 +33,7 @@ features = [
     "Media_Capture",
     "Media_Capture_Frames",
     "Media_FaceAnalysis",
-    "Media_MediaProperties",
     "Graphics_Imaging",
-    "Foundation",
     "Foundation_Collections",
 ]
 
