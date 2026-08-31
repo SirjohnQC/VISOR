@@ -1,5 +1,6 @@
 use crate::actions::Resolver;
 use crate::actions::overlay;
+use crate::core::engine::CheckSlot;
 use crate::core::types::{Command, DisplayLevel, State};
 use crate::error::{Result, VisorError};
 use std::sync::Arc;
@@ -22,6 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 const ICON_PX: u32 = 32;
+
+/// How long a camera-check result stays in the tooltip before the normal state
+/// text takes over again.
+const VERDICT_HOLD: std::time::Duration = std::time::Duration::from_secs(12);
 
 pub fn tooltip(s: State) -> String {
     let detail = match s {
@@ -61,6 +66,7 @@ pub fn run(
     status: Arc<AtomicU8>,
     levels: Receiver<DisplayLevel>,
     resolver: &mut Resolver,
+    check: CheckSlot,
 ) -> Result<()> {
     let win = |e: tray_icon::BadIcon| VisorError::Windows(e.to_string());
     // Slate for normal operation, amber for the Degraded warning.
@@ -71,8 +77,9 @@ pub fn run(
     let pause = MenuItem::new("Pause", true, None);
     let resume = MenuItem::new("Resume", true, None);
     let reload = MenuItem::new("Reload config", true, None);
+    let check_cam = MenuItem::new("Check camera", true, None);
     let quit = MenuItem::new("Quit", true, None);
-    menu.append_items(&[&pause, &resume, &reload, &quit])
+    menu.append_items(&[&pause, &resume, &check_cam, &reload, &quit])
         .map_err(|e| VisorError::Windows(e.to_string()))?;
 
     let tray = TrayIconBuilder::new()
@@ -84,6 +91,8 @@ pub fn run(
 
     let menu_rx = MenuEvent::receiver();
     let mut shown = State::Active;
+    let mut verdict_until: Option<std::time::Instant> = None;
+    let mut shown_verdict = false;
 
     // Ruling F12: dedicated message-only window so WM_DISPLAYCHANGE and
     // WM_POWERBROADCAST are always caught, independent of whether/how many
@@ -113,6 +122,8 @@ pub fn run(
                 Some(Command::Resume)
             } else if ev.id == *reload.id() {
                 Some(Command::Reload)
+            } else if ev.id == *check_cam.id() {
+                Some(Command::CheckCamera)
             } else if ev.id == *quit.id() {
                 Some(Command::Quit)
             } else {
@@ -161,8 +172,27 @@ pub fn run(
             resolver.apply(level);
         }
 
+        // A camera-check result outranks the state tooltip for a few seconds:
+        // the user just asked the question, so they should get the answer even
+        // if the state changes underneath them.
+        if let Ok(mut slot) = check.lock()
+            && let Some(msg) = slot.take()
+        {
+            let _ = tray.set_tooltip(Some(&msg));
+            verdict_until = Some(std::time::Instant::now() + VERDICT_HOLD);
+            shown_verdict = true;
+        }
+        if let Some(until) = verdict_until {
+            if std::time::Instant::now() < until {
+                std::thread::sleep(POLL);
+                continue;
+            }
+            verdict_until = None;
+        }
+
         let current = State::from_u8(status.load(Ordering::Relaxed));
-        if current != shown {
+        if current != shown || shown_verdict {
+            shown_verdict = false;
             shown = current;
             let _ = tray.set_tooltip(Some(tooltip(current)));
             let icon = if is_warning(current) {

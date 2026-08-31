@@ -40,6 +40,9 @@ fn main() {
 
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(AtomicU8::new(0));
+    // Only the engine owns the camera, so only it can answer "can you see me?".
+    // It publishes the verdict here for the tray to display.
+    let check: visor::core::engine::CheckSlot = Arc::new(std::sync::Mutex::new(None));
 
     // Ruling F10: `MediaCapture` (and so `WinRtCamera`) is not `Send` --
     // verified in task 12, the same shape of problem as `PHYSICAL_MONITOR` in
@@ -50,17 +53,18 @@ fn main() {
     // itself are both constructed on the thread that will actually use them.
     let handle = thread::spawn({
         let status = Arc::clone(&status);
+        let check_engine = Arc::clone(&check);
         move || {
             let camera = Box::new(WinRtCamera::new(""));
             let display = Box::new(ChannelDisplay { tx: level_tx });
             let engine = Engine::new(cfg, idle, camera, display);
-            engine.run(rx, status)
+            engine.run(rx, status, check_engine)
         }
     });
 
     // The message pump must own the main thread; the engine ticks on the
     // spawned one.
-    if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver) {
+    if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver, check) {
         tracing::error!(error = %e, "tray failed");
     }
 

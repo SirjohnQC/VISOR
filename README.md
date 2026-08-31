@@ -69,6 +69,33 @@ hardware over long sessions, and a false "you're still here" would mean a
 screen that never sleeps — exactly the wrong failure direction for a panel
 VISOR exists to protect. Turn it on once you trust your own setup.
 
+## Checking that the camera can actually see you
+
+Choose **Check camera** from the tray menu. VISOR samples ten frames over about
+two seconds and puts the verdict in the tray tooltip (and the log), where it
+stays for twelve seconds.
+
+This exists because every way presence detection can fail looks identical from
+the outside — a covered lens, a camera pointed at the ceiling, another app
+holding the device, or simply sitting further away than `min_face_ratio`
+allows all produce exactly one visible symptom: VISOR dims on you as though the
+room were empty. The check tells the four apart:
+
+| Verdict | Meaning |
+|---|---|
+| *Camera sees you* | A face was detected and clears `min_face_ratio`. |
+| *Face seen but too small* | It can see you, but at a smaller share of the frame than `min_face_ratio` requires, so the state machine counts you as away. The message suggests a specific lower value to put in the config. |
+| *Camera works, but no face was detected* | Frames are arriving; nothing that looks like a face is in them. Check the aim and the lighting. |
+| *Camera unavailable* | No usable frame at all — covered, unplugged, in use by another app, or blocked by Windows camera privacy settings. |
+
+Use it to tune `min_face_ratio` for how you actually sit: run it from your
+normal working position, and if it reports *too small*, either move closer or
+take the suggested value.
+
+Checking from `Active` opens the camera only for the length of the check and
+closes it again afterwards, so it does not weaken the rule that the lens stays
+shut while you are present.
+
 ## Monitor requirements: DDC/CI
 
 Dimming and true power-off go through DDC/CI (VCP feature codes over the

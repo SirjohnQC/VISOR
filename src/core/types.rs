@@ -47,5 +47,9 @@ pub enum Command {
     Pause,
     Resume,
     Reload,
+    /// Run a short probe and report whether the camera can actually see the
+    /// user. Every way this can fail is otherwise silent — a covered lens, a
+    /// bad angle, or a face below `min_face_ratio` all just look like absence.
+    CheckCamera,
     Quit,
 }

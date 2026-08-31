@@ -1,12 +1,13 @@
 use crate::actions::DisplayControl;
 use crate::config::Config;
+use crate::core::check::{CameraVerdict, camera_verdict};
 use crate::core::machine::Machine;
 use crate::core::types::{Command, DisplayLevel, Effect, FaceResult, State};
 use crate::sense::camera::Camera;
 use crate::sense::idle::IdleSource;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 impl State {
@@ -34,6 +35,16 @@ impl State {
     }
 }
 
+/// Where the engine publishes the result of a `CheckCamera` run for the tray
+/// to display. The engine owns the camera, so only it can run the probe.
+pub type CheckSlot = Arc<Mutex<Option<String>>>;
+
+/// How many frames a camera check samples, and how long it waits between them.
+/// Two seconds total: long enough for exposure to settle and for the user to be
+/// looking at the screen, short enough that blocking the tick loop is harmless.
+const CHECK_SAMPLES: usize = 10;
+const CHECK_INTERVAL: Duration = Duration::from_millis(200);
+
 pub struct Engine {
     machine: Machine,
     idle: Arc<dyn IdleSource + Sync>,
@@ -41,6 +52,9 @@ pub struct Engine {
     display: Box<dyn DisplayControl>,
     camera_open: bool,
     cadence: Duration,
+    /// Kept alongside the machine so `check_camera` can judge against the same
+    /// threshold the machine uses. Updated on reload.
+    min_face_ratio: f32,
 }
 
 impl Engine {
@@ -57,6 +71,7 @@ impl Engine {
             display,
             camera_open: false,
             cadence: Duration::from_secs(1),
+            min_face_ratio: cfg.presence.min_face_ratio,
         }
     }
 
@@ -78,6 +93,7 @@ impl Engine {
     pub fn reload(&mut self, cfg: Config) {
         self.display.apply(DisplayLevel::Full);
         self.machine = Self::build_machine(&cfg);
+        self.min_face_ratio = cfg.presence.min_face_ratio;
         if self.camera_open {
             self.camera.close();
             self.camera_open = false;
@@ -136,7 +152,39 @@ impl Engine {
 
     /// Blocking loop. Returns when a `Quit` command arrives or the channel
     /// closes.
-    pub fn run(mut self, rx: Receiver<Command>, status: Arc<AtomicU8>) {
+    /// Probe the camera a few times and report what it can see.
+    ///
+    /// Opens the camera if it is closed and closes it again afterwards, so a
+    /// check from `Active` -- the common case, where the camera is deliberately
+    /// off -- does not leave it running. Blocks the tick loop for about two
+    /// seconds; that is acceptable because this only ever runs when the user
+    /// explicitly asks for it from the tray.
+    pub fn check_camera(&mut self) -> CameraVerdict {
+        let was_open = self.camera_open;
+        if !was_open {
+            self.camera.open();
+            self.camera_open = true;
+        }
+
+        let mut samples = Vec::with_capacity(CHECK_SAMPLES);
+        for i in 0..CHECK_SAMPLES {
+            if i > 0 {
+                std::thread::sleep(CHECK_INTERVAL);
+            }
+            samples.push(self.camera.probe());
+        }
+
+        if !was_open {
+            self.camera.close();
+            self.camera_open = false;
+        }
+
+        let verdict = camera_verdict(&samples, self.min_face_ratio);
+        tracing::info!(?verdict, "camera check: {}", verdict.message());
+        verdict
+    }
+
+    pub fn run(mut self, rx: Receiver<Command>, status: Arc<AtomicU8>, check: CheckSlot) {
         loop {
             let state = self.tick(Instant::now());
             status.store(state.as_u8(), Ordering::Relaxed);
@@ -145,6 +193,12 @@ impl Engine {
                 Ok(Command::Quit) => {
                     self.shutdown(state);
                     return;
+                }
+                Ok(Command::CheckCamera) => {
+                    let verdict = self.check_camera();
+                    if let Ok(mut slot) = check.lock() {
+                        *slot = Some(verdict.message());
+                    }
                 }
                 Ok(Command::Reload) => {
                     // Config lives on disk, not in the message: re-read it
@@ -182,7 +236,89 @@ mod tests {
     use crate::actions::SpyDisplay;
     use crate::sense::camera::FakeCamera;
     use crate::sense::idle::FakeIdle;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_camera_check_from_active_leaves_the_camera_closed_again() {
+        // The common case: the user asks from Active, where the camera is
+        // deliberately off. Checking must not leave it running afterwards --
+        // that would quietly break the promise that the lens stays shut while
+        // the user is present.
+        let cam = FakeCamera::new(vec![
+            FaceResult::Face {
+                count: 1,
+                largest_ratio: 0.42
+            };
+            16
+        ]);
+        let opens = cam.open_count();
+        let closes = cam.close_count();
+        let mut engine = Engine::new(
+            Config::default(),
+            Arc::new(FakeIdle::new(Duration::ZERO)),
+            Box::new(cam),
+            Box::new(SpyDisplay::new()),
+        );
+
+        let verdict = engine.check_camera();
+        assert!(
+            verdict.is_ok(),
+            "a 0.42 face clears the 0.15 default: {verdict:?}"
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        assert_eq!(closes.load(Ordering::Relaxed), 1, "must close it again");
+        assert_eq!(
+            engine.state(),
+            State::Active,
+            "checking is not a state change"
+        );
+    }
+
+    #[test]
+    fn a_camera_check_reports_a_face_that_is_too_small_to_count() {
+        // The failure this whole feature exists for: the camera works and sees
+        // the user, but below min_face_ratio the machine treats them as away,
+        // and nothing else in VISOR would ever tell them why.
+        let cam = FakeCamera::new(vec![
+            FaceResult::Face {
+                count: 1,
+                largest_ratio: 0.08
+            };
+            16
+        ]);
+        let mut engine = Engine::new(
+            Config::default(),
+            Arc::new(FakeIdle::new(Duration::ZERO)),
+            Box::new(cam),
+            Box::new(SpyDisplay::new()),
+        );
+
+        let verdict = engine.check_camera();
+        assert!(!verdict.is_ok());
+        let msg = verdict.message();
+        assert!(msg.contains("0.080"), "reports what it saw: {msg}");
+        assert!(msg.contains("min_face_ratio"), "names the setting: {msg}");
+    }
+
+    #[test]
+    fn a_camera_check_while_watching_leaves_the_camera_open() {
+        // Checking from a state that legitimately has the camera open must not
+        // close it and strip the machine of its input.
+        let idle = Arc::new(FakeIdle::new(Duration::from_secs(30)));
+        let cam = FakeCamera::new(vec![FaceResult::NoFace; 16]);
+        let closes = cam.close_count();
+        let mut engine = Engine::new(
+            Config::default(),
+            idle,
+            Box::new(cam),
+            Box::new(SpyDisplay::new()),
+        );
+        engine.tick(Instant::now());
+        assert_eq!(engine.state(), State::Watching);
+
+        engine.check_camera();
+        assert_eq!(closes.load(Ordering::Relaxed), 0, "must leave it open");
+    }
 
     #[test]
     fn the_state_byte_round_trips_for_every_state() {
@@ -250,7 +386,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Command::Quit).unwrap();
-        engine.run(rx, status.clone());
+        engine.run(rx, status.clone(), Arc::new(Mutex::new(None)));
 
         assert_eq!(
             seen.lock().unwrap().last(),
@@ -280,7 +416,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel::<Command>();
         drop(tx);
-        engine.run(rx, Arc::new(AtomicU8::new(0)));
+        engine.run(rx, Arc::new(AtomicU8::new(0)), Arc::new(Mutex::new(None)));
 
         assert_eq!(
             seen.lock().unwrap().last(),
