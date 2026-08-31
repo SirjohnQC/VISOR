@@ -1,6 +1,9 @@
 use crate::core::types::DisplayLevel;
 use std::sync::{Arc, Mutex};
 
+pub mod monitors;
+pub mod overlay;
+
 pub trait DisplayControl: Send {
     /// Bring every target monitor to `level`. Errors are logged internally;
     /// a failure must never propagate into a state change (spec §8).
