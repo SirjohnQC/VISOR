@@ -237,6 +237,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_overlay_window_is_created_for_every_monitor() {
+        // The visual test completing "without panicking" proves nothing: the
+        // creation failure path deliberately logs and carries on, so a run in
+        // which every CreateWindowExW failed looks identical. This asserts the
+        // windows genuinely exist.
+        let expected = crate::actions::monitors::enumerate().len();
+        assert!(expected > 0, "a running desktop must have a monitor");
+
+        let o = OverlayControl::new();
+        assert_eq!(
+            o.windows.len(),
+            expected,
+            "every enumerated monitor must get an overlay window"
+        );
+        // Dropping `o` destroys them; if DestroyWindow were wrong this would
+        // leak a topmost black window over the desktop, which is loud enough
+        // to notice.
+    }
+
+    #[test]
     fn alpha_for_dim_is_proportional_to_the_missing_brightness() {
         // Dim(100) means full brightness, so no darkening at all.
         assert_eq!(alpha_for(DisplayLevel::Dim(100)), 0);
