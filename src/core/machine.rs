@@ -21,12 +21,6 @@ pub struct Machine {
     face_run: u8,
     probation: Option<Probation>,
     unknown_run: u8,
-    /// When the current unrelieved run of `Unknown`s began. The 5-minute
-    /// `Degraded` retry timer is measured from here (the first failure),
-    /// not from the tick that actually crosses the threshold and flips the
-    /// state — mirroring how `miss_streak_start` is measured from the first
-    /// miss rather than from the tick a rung boundary is crossed.
-    unknown_streak_start: Option<Instant>,
     degraded_since: Option<Instant>,
     /// Spec §7 `hold_awake_while_present`. Off by default.
     awake_hold: bool,
@@ -45,7 +39,6 @@ impl Machine {
             face_run: 0,
             probation: None,
             unknown_run: 0,
-            unknown_streak_start: None,
             degraded_since: None,
             awake_hold: false,
             awake_hold_asserted: false,
@@ -82,7 +75,6 @@ impl Machine {
         self.miss_streak_start = None;
         self.face_run = 0;
         self.unknown_run = 0;
-        self.unknown_streak_start = None;
         self.probation = None;
         self.degraded_since = None;
         Vec::new()
@@ -95,14 +87,22 @@ impl Machine {
                 self.miss_streak_start = None;
                 self.face_run = 0;
                 self.probation = None;
-                (
-                    self.state,
-                    vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera],
-                )
+                // `step` returns immediately while Paused, so this is the only
+                // chance to release the hold. Without it, pausing VISOR would
+                // keep the system awake for the whole duration of the pause.
+                let mut fx = vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera];
+                if let Some(e) = self.awake_hold_effect(self.state) {
+                    fx.push(e);
+                }
+                (self.state, fx)
             }
             Command::Resume if self.state == State::Paused => {
                 self.state = State::Active;
-                (self.state, Vec::new())
+                let mut fx = Vec::new();
+                if let Some(e) = self.awake_hold_effect(self.state) {
+                    fx.push(e);
+                }
+                (self.state, fx)
             }
             _ => (self.state, Vec::new()),
         }
@@ -250,16 +250,13 @@ impl Machine {
         // third tick. Placing it here means unknown_run only accumulates
         // while the camera is genuinely open (Watching/Dimmed/Away/Deep).
         if matches!(face, FaceResult::Unknown) {
-            if self.unknown_run == 0 {
-                self.unknown_streak_start = Some(now);
-            }
             self.unknown_run = self.unknown_run.saturating_add(1);
             if self.unknown_run >= 3 {
                 self.state = State::Degraded;
-                // The 5-minute retry timer starts from the first Unknown of
-                // this run, not from this tick — the same "measured from the
-                // first miss" convention `miss_streak_start` already uses.
-                self.degraded_since = self.unknown_streak_start;
+                // Spec §4.7 — "the camera is retried every 5 minutes". The retry
+                // clock measures time since VISOR gave up, so it starts here, at
+                // the tick that enters Degraded and closes the camera.
+                self.degraded_since = Some(now);
                 self.probation = None;
                 self.miss_streak_start = None;
                 let mut fx = vec![Effect::SetDisplay(DisplayLevel::Full), Effect::CloseCamera];
@@ -270,7 +267,6 @@ impl Machine {
             }
         } else {
             self.unknown_run = 0;
-            self.unknown_streak_start = None;
         }
 
         self.update_streak(face, now);
@@ -822,6 +818,34 @@ mod tests {
     }
 
     #[test]
+    fn pausing_releases_the_awake_hold() {
+        let mut m = machine();
+        let t0 = Instant::now();
+        m.set_awake_hold(true);
+
+        // Entering Watching asserts the hold.
+        let (_, fx) = m.step(Duration::from_secs(30), FaceResult::Unknown, t0);
+        assert!(fx.contains(&Effect::SetAwakeHold(true)));
+
+        // Pause must release it. `step` returns early while Paused, so if the
+        // command does not emit this, nothing ever will and the system stays
+        // awake for the whole pause.
+        let (s, fx) = m.command(Command::Pause, t0 + Duration::from_secs(5));
+        assert_eq!(s, State::Paused);
+        assert!(
+            fx.contains(&Effect::SetAwakeHold(false)),
+            "pause must release the awake hold, got {fx:?}"
+        );
+
+        let (s, fx) = m.command(Command::Resume, t0 + Duration::from_secs(6));
+        assert_eq!(s, State::Active);
+        assert!(
+            fx.contains(&Effect::SetAwakeHold(true)),
+            "resume re-asserts it, got {fx:?}"
+        );
+    }
+
+    #[test]
     fn a_successful_probe_run_recovers_from_degraded() {
         let mut m = machine();
         let t0 = into_rung(&mut m, State::Away);
@@ -838,7 +862,7 @@ mod tests {
         let (s, fx) = m.step(
             Duration::from_secs(999),
             PRESENT,
-            t0 + Duration::from_secs(902 + 5 * 60),
+            t0 + Duration::from_secs(904 + 5 * 60),
         );
         assert_eq!(s, State::Active);
         assert!(
