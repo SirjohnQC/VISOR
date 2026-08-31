@@ -7,7 +7,7 @@ use visor::actions::{ChannelDisplay, Resolver};
 use visor::config::Config;
 use visor::core::engine::Engine;
 use visor::core::types::DisplayLevel;
-use visor::sense::camera::FakeCamera;
+use visor::sense::camera::WinRtCamera;
 use visor::sense::idle::Win32Idle;
 
 fn main() {
@@ -28,12 +28,8 @@ fn main() {
     let cfg = Config::load_or_default(&path);
     tracing::info!(?cfg, "VISOR starting");
 
-    // Real idle source and a real tray, but the camera and display are still
-    // fakes: real vision and real display control land in later tasks. An
-    // empty script makes `FakeCamera` report `NoFace` forever, which is
-    // enough to walk the ladder in the log.
+    // Real idle source; camera and display are real too as of task 12.
     let idle: Arc<dyn visor::sense::idle::IdleSource + Sync> = Arc::new(Win32Idle::new());
-    let camera = Box::new(FakeCamera::new(Vec::new()));
 
     // Ruling F8: the real display stack lives on THIS thread. Overlay windows
     // must belong to the thread that pumps messages, and PHYSICAL_MONITOR is
@@ -41,15 +37,25 @@ fn main() {
     // system enforces that for us. The engine gets a channel instead.
     let mut resolver = Resolver::new(&cfg.display);
     let (level_tx, level_rx) = mpsc::channel();
-    let display = Box::new(ChannelDisplay { tx: level_tx });
-    let engine = Engine::new(cfg, idle, camera, display);
 
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(AtomicU8::new(0));
 
+    // Ruling F10: `MediaCapture` (and so `WinRtCamera`) is not `Send` --
+    // verified in task 12, the same shape of problem as `PHYSICAL_MONITOR` in
+    // task 10. `Engine` owns a `Box<dyn Camera>`, so it cannot be built here
+    // and moved into the spawned thread as a value. Instead only the
+    // Send+Sync ingredients (the config, the idle source, and the display
+    // channel's `Sender`) cross the boundary, and the camera and the `Engine`
+    // itself are both constructed on the thread that will actually use them.
     let handle = thread::spawn({
         let status = Arc::clone(&status);
-        move || engine.run(rx, status)
+        move || {
+            let camera = Box::new(WinRtCamera::new(""));
+            let display = Box::new(ChannelDisplay { tx: level_tx });
+            let engine = Engine::new(cfg, idle, camera, display);
+            engine.run(rx, status)
+        }
     });
 
     // The message pump must own the main thread; the engine ticks on the

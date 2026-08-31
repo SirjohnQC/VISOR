@@ -30,6 +30,13 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
     "Win32_Devices_Display",
+    "Media_Capture",
+    "Media_Capture_Frames",
+    "Media_FaceAnalysis",
+    "Media_MediaProperties",
+    "Graphics_Imaging",
+    "Foundation",
+    "Foundation_Collections",
 ]
 
 [profile.release]

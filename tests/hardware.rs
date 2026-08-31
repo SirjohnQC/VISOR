@@ -2,6 +2,35 @@
 //!   cargo test --test hardware -- --ignored --nocapture --test-threads=1
 
 use visor::actions::{ddc::DdcMonitor, monitors};
+use visor::core::types::FaceResult;
+use visor::sense::camera::{Camera, WinRtCamera};
+
+#[test]
+#[ignore = "requires a webcam and a person in front of it"]
+fn detects_a_face_and_reports_a_plausible_ratio() {
+    let mut cam = WinRtCamera::new("");
+    cam.open();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut saw_face = false;
+    for _ in 0..10 {
+        match cam.probe() {
+            FaceResult::Face {
+                count,
+                largest_ratio,
+            } => {
+                println!("count={count} ratio={largest_ratio:.3}");
+                assert!(largest_ratio > 0.0 && largest_ratio <= 1.0);
+                saw_face = true;
+            }
+            FaceResult::NoFace => println!("no face"),
+            FaceResult::Unknown => println!("unknown (error)"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    cam.close();
+    assert!(saw_face, "sit in front of the camera while running this");
+}
 
 #[test]
 #[ignore = "requires a DDC/CI-capable monitor"]
