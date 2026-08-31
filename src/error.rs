@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum VisorError {
     #[error("config validation failed: {0}")]

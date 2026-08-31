@@ -4,3 +4,4 @@ pub mod core;
 pub mod error;
 pub mod logging;
 pub mod sense;
+pub mod ui;

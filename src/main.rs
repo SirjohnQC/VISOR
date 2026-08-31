@@ -27,29 +27,38 @@ fn main() {
     let cfg = Config::load_or_default(&path);
     tracing::info!(?cfg, "VISOR starting");
 
-    // Real idle source, but the camera and display are still fakes: real
-    // vision (Task 9-ish) and real display control (later tasks) are not
-    // wired up yet. An empty script makes `FakeCamera` report `NoFace`
-    // forever, which is enough to walk the ladder in the log.
+    // Real idle source and a real tray, but the camera and display are still
+    // fakes: real vision and real display control land in later tasks. An
+    // empty script makes `FakeCamera` report `NoFace` forever, which is
+    // enough to walk the ladder in the log.
     let idle: Arc<dyn visor::sense::idle::IdleSource + Sync> = Arc::new(Win32Idle::new());
     let camera = Box::new(FakeCamera::new(Vec::new()));
     let display = Box::new(SpyDisplay::new());
     let engine = Engine::new(cfg, idle, camera, display);
 
-    // The tray icon and the real command channel arrive in Task 8. For now
-    // there is no producer of `Command`s, so we just hold `tx` alive for the
-    // lifetime of `main` -- dropping it would make `rx.recv_timeout` see
-    // `Disconnected` on the engine thread's very first timeout and return
-    // immediately, ending the loop before anything is observable in the log.
-    let (_tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     let status = Arc::new(AtomicU8::new(0));
 
-    let handle = thread::spawn(move || engine.run(rx, status));
+    let handle = thread::spawn({
+        let status = Arc::clone(&status);
+        move || engine.run(rx, status)
+    });
 
-    // Keep `main` alive so the engine thread keeps ticking. The Win32
-    // message pump that should own this thread lands in Task 8; until then,
-    // blocking on the engine thread's join handle is the simplest way to
-    // keep the process running (it will not return, since nothing ever
-    // sends `Command::Quit`).
-    handle.join().expect("engine thread panicked");
+    // The message pump must own the main thread; the engine ticks on the
+    // spawned one.
+    let outcome = visor::ui::tray::run(tx, status);
+    if let Err(e) = &outcome {
+        tracing::error!(error = %e, "tray failed");
+    }
+
+    // Join before exiting, so the engine's shutdown path -- which applies
+    // DisplayLevel::Full -- actually completes. Exiting with the panel dark is
+    // the one outcome this whole program exists to prevent, so this join is
+    // load-bearing, not tidiness. `tray::run` has dropped its `Sender` by now,
+    // so the engine sees either the Quit it was sent or a Disconnected; both
+    // restore the display.
+    if handle.join().is_err() {
+        tracing::error!("engine thread panicked");
+    }
+    tracing::info!("VISOR stopped");
 }
