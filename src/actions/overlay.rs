@@ -2,12 +2,14 @@ use crate::actions::DisplayControl;
 use crate::actions::monitors::{self};
 use crate::core::types::DisplayLevel;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::CreateSolidBrush;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, LWA_ALPHA, RegisterClassW, SW_HIDE,
-    SW_SHOWNOACTIVATE, SetLayeredWindowAttributes, ShowWindow, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_MESSAGE, LWA_ALPHA,
+    PBT_APMRESUMEAUTOMATIC, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetLayeredWindowAttributes,
+    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 #[cfg(test)]
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -33,12 +35,48 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Standard passthrough — the overlay never customizes message handling, so
-/// every message goes straight to the default procedure.
+/// Set by the WndProc when Windows delivers `WM_DISPLAYCHANGE` (a monitor was
+/// added, removed, or its mode changed). Cleared by `take_display_changed`.
+static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Set by the WndProc on `WM_POWERBROADCAST` / `PBT_APMRESUMEAUTOMATIC`
+/// (the system resumed from sleep). Cleared by `take_resumed`.
+static RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// Ruling F12: `PeekMessageW` in the tray pump only drains this *thread's*
+/// queue, but `WM_DISPLAYCHANGE`/`WM_POWERBROADCAST` are delivered to a
+/// *window*. The tray icon's window belongs to `tray-icon`'s own private
+/// WndProc, which we do not control, so this overlay/broadcast window class's
+/// WndProc — on the same thread — is where these must be caught instead.
+/// Read-and-clear each iteration of the pump loop; see `ui::tray::run`.
+pub fn take_display_changed() -> bool {
+    DISPLAY_CHANGED.swap(false, Ordering::AcqRel)
+}
+
+/// Read-and-clear counterpart to `DISPLAY_CHANGED` for system resume.
+pub fn take_resumed() -> bool {
+    RESUMED.swap(false, Ordering::AcqRel)
+}
+
+/// Passthrough for everything except the two broadcasts VISOR cares about.
+///
+/// A WndProc must stay fast and must not block: for both messages this only
+/// sets a flag and falls through to `DefWindowProcW`. It never rescans
+/// monitors or sends a command itself — that work happens on the pump's next
+/// iteration (same thread, but outside the message dispatcher's call stack).
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_DISPLAYCHANGE => {
+            DISPLAY_CHANGED.store(true, Ordering::Release);
+        }
+        WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
+            RESUMED.store(true, Ordering::Release);
+        }
+        _ => {}
+    }
     // SAFETY: `hwnd`/`wparam`/`lparam` are handed to us unchanged by the
     // Windows message dispatcher and passed straight through; we never
-    // interpret them ourselves.
+    // interpret them ourselves beyond the read-only match above.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -112,10 +150,68 @@ fn create_window(rect: RECT) -> Option<isize> {
     }
 }
 
+/// A hidden, message-only window that exists solely to receive
+/// `WM_DISPLAYCHANGE` and `WM_POWERBROADCAST` (ruling F12).
+///
+/// Overlay windows are not a reliable place to catch these: `Resolver::rescan`
+/// destroys and recreates the whole set on every call, and if configured
+/// `display.targets` matches zero monitors there may be no overlay window at
+/// all. This window is independent of that lifecycle — created once when the
+/// pump starts and kept alive for the whole run — so the broadcasts are
+/// always caught regardless of how many (or how few) overlay windows exist at
+/// any given moment.
+///
+/// Returns `None` (after logging) rather than panicking, matching
+/// `create_window`'s fail-toward-the-screen-staying-on stance: if this
+/// window can't be created, VISOR still runs, it just won't react to
+/// display-change/resume broadcasts until the next tick's own state check.
+pub(crate) fn create_broadcast_window() -> Option<OverlayWindow> {
+    register_class_once();
+    let class_name = wide(CLASS_NAME);
+    // SAFETY: `class_name` is a valid null-terminated UTF-16 buffer alive for
+    // the duration of this call. `HWND_MESSAGE` marks this as a message-only
+    // window, so it needs no size, position, or visible style — it is never
+    // shown and never receives anything but messages.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR::null(),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            None,
+            no_hinstance(),
+            None,
+        )
+    };
+    match hwnd {
+        Ok(h) => Some(OverlayWindow {
+            handle: h.0 as isize,
+        }),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "failed to create the message-only broadcast window; \
+                 WM_DISPLAYCHANGE/WM_POWERBROADCAST will not be observed"
+            );
+            None
+        }
+    }
+}
+
 /// One layered overlay window. Kept as `isize` rather than `HWND` so
 /// `OverlayControl` stays `Send` (it is only ever driven from the thread that
 /// created it, per the contract on `OverlayControl` itself).
-struct OverlayWindow {
+///
+/// `pub(crate)` rather than private: `create_broadcast_window` below also
+/// returns one, so the pump thread (`ui::tray::run`) can hold it alive for as
+/// long as it needs a window to receive broadcasts, without exposing the
+/// Win32 handle itself outside this module.
+pub(crate) struct OverlayWindow {
     handle: isize,
 }
 

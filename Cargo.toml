@@ -30,6 +30,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
     "Win32_Devices_Display",
+    "Win32_System_Power",
     "Media_Capture",
     "Media_Capture_Frames",
     "Media_FaceAnalysis",

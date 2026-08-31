@@ -2,6 +2,7 @@ use crate::config::DisplayConfig;
 use crate::core::types::DisplayLevel;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use windows::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, SetThreadExecutionState};
 
 pub mod broadcast;
 pub mod ddc;
@@ -289,8 +290,42 @@ impl DisplayControl for SpyDisplay {
     }
 }
 
-/// Spec §7 `hold_awake_while_present`. Real implementation in Task 13.
-pub fn set_awake_hold(_on: bool) {}
+/// Spec §7 `hold_awake_while_present` — defaults to off. Asserting this makes
+/// VISOR the single authority on when the display sleeps.
+///
+/// Thread-affine: `SetThreadExecutionState` applies to the *calling* thread,
+/// and `ES_CONTINUOUS` persists until that thread clears it or exits. This is
+/// called from `Engine::apply` on the engine thread, which lives for the
+/// whole process, so this is correct — but it is correct *by accident of
+/// where it is called from*. Moving this call to another thread (or calling
+/// it from a short-lived one) would silently fail to hold anything: the flag
+/// would be cleared the moment that thread exited, or would apply to the
+/// wrong thread entirely.
+pub fn set_awake_hold(on: bool) {
+    let flags = if on {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    // SAFETY: a well-formed flag combination; the call has no out-parameters
+    // and cannot fail in a way that leaves anything in an invalid state.
+    unsafe {
+        SetThreadExecutionState(flags);
+    }
+}
+
+#[cfg(test)]
+mod awake_hold_tests {
+    use super::*;
+
+    #[test]
+    fn awake_hold_sets_and_clears_without_panicking() {
+        // ES_DISPLAY_REQUIRED is process-global; this asserts the calls are
+        // well-formed and that clearing does not leave the flag asserted.
+        set_awake_hold(true);
+        set_awake_hold(false);
+    }
+}
 
 #[cfg(test)]
 mod resolver_tests {

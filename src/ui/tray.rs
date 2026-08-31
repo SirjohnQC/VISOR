@@ -1,4 +1,5 @@
 use crate::actions::Resolver;
+use crate::actions::overlay;
 use crate::core::types::{Command, DisplayLevel, State};
 use crate::error::{Result, VisorError};
 use std::sync::Arc;
@@ -84,6 +85,13 @@ pub fn run(
     let menu_rx = MenuEvent::receiver();
     let mut shown = State::Active;
 
+    // Ruling F12: dedicated message-only window so WM_DISPLAYCHANGE and
+    // WM_POWERBROADCAST are always caught, independent of whether/how many
+    // overlay windows currently exist (they are destroyed and recreated on
+    // every `Resolver::rescan`). Held alive for the whole pump loop; dropping
+    // it at the end of this function destroys it.
+    let _broadcast_window = overlay::create_broadcast_window();
+
     loop {
         // Pump Win32 messages — tray-icon delivers its events through them.
         let mut msg = MSG::default();
@@ -111,11 +119,37 @@ pub fn run(
                 None
             };
             if let Some(c) = cmd {
+                if c == Command::Reload {
+                    // Ruling F8: the `Resolver` lives on this thread, not the
+                    // engine's, so a reload has to be actioned here too —
+                    // `Engine::reload` cannot reach it.
+                    resolver.rescan();
+                }
                 // A send failure means the engine thread is already gone;
                 // quitting is then the only sensible response.
                 if tx.send(c).is_err() || c == Command::Quit {
                     return Ok(());
                 }
+            }
+        }
+
+        // Spec §8: "Monitor hot-unplug: re-enumerate and re-probe on
+        // WM_DISPLAYCHANGE" / "System resume: re-probe DDC; assume Active".
+        // Both are handled the same way: rescan the Resolver right here (main
+        // thread), then forward the same `Command::Reload` the tray menu
+        // uses so the engine resets its machine and re-reads config too.
+        if overlay::take_display_changed() {
+            tracing::info!("WM_DISPLAYCHANGE observed; rescanning display targets");
+            resolver.rescan();
+            if tx.send(Command::Reload).is_err() {
+                return Ok(());
+            }
+        }
+        if overlay::take_resumed() {
+            tracing::info!("system resume observed; rescanning display targets");
+            resolver.rescan();
+            if tx.send(Command::Reload).is_err() {
+                return Ok(());
             }
         }
 

@@ -50,10 +50,8 @@ impl Engine {
         camera: Box<dyn Camera>,
         display: Box<dyn DisplayControl>,
     ) -> Self {
-        let mut machine = Machine::new(cfg.presence.clone(), cfg.display.dim_level);
-        machine.set_awake_hold(cfg.display.hold_awake_while_present);
         Self {
-            machine,
+            machine: Self::build_machine(&cfg),
             idle,
             camera,
             display,
@@ -62,8 +60,29 @@ impl Engine {
         }
     }
 
+    fn build_machine(cfg: &Config) -> Machine {
+        let mut machine = Machine::new(cfg.presence.clone(), cfg.display.dim_level);
+        machine.set_awake_hold(cfg.display.hold_awake_while_present);
+        machine
+    }
+
     pub fn state(&self) -> State {
         self.machine.state()
+    }
+
+    /// Rebuild the machine from a new config, preserving nothing — a reload
+    /// is a deliberate reset, and it always leaves the display lit (spec
+    /// §2.1). The camera is closed too: the fresh machine starts in `Active`,
+    /// which never has the camera open, so leaving it running would be a
+    /// stale effect the new machine never asked for.
+    pub fn reload(&mut self, cfg: Config) {
+        self.display.apply(DisplayLevel::Full);
+        self.machine = Self::build_machine(&cfg);
+        if self.camera_open {
+            self.camera.close();
+            self.camera_open = false;
+        }
+        tracing::info!("config reloaded");
     }
 
     /// One iteration. Separated from `run` so tests can drive it with a
@@ -126,6 +145,17 @@ impl Engine {
                 Ok(Command::Quit) => {
                     self.shutdown(state);
                     return;
+                }
+                Ok(Command::Reload) => {
+                    // Config lives on disk, not in the message: re-read it
+                    // here rather than plumbing its contents through the
+                    // channel. `Resolver::rescan` is NOT called from here —
+                    // ruling F8 keeps the `Resolver` on the main thread, so
+                    // the pump calls `rescan` itself when it forwards this
+                    // same `Command::Reload` (see `ui::tray::run`).
+                    let cfg = Config::load_or_default(&Config::default_path());
+                    self.reload(cfg);
+                    status.store(self.state().as_u8(), Ordering::Relaxed);
                 }
                 Ok(cmd) => {
                     let (state, effects) = self.machine.command(cmd, Instant::now());
@@ -337,5 +367,49 @@ mod tests {
         }
         assert_eq!(engine.state(), State::Degraded);
         assert_eq!(*seen.lock().unwrap(), vec![DisplayLevel::Full]);
+    }
+
+    #[test]
+    fn reload_applies_new_thresholds_without_restarting() {
+        let idle = Arc::new(FakeIdle::new(Duration::from_secs(30)));
+        let mut engine = Engine::new(
+            Config::default(),
+            idle,
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 32])),
+            Box::new(SpyDisplay::new()),
+        );
+        let t0 = Instant::now();
+        engine.tick(t0);
+
+        let mut cfg = Config::default();
+        cfg.presence.dim_after = Duration::from_secs(5);
+        engine.reload(cfg);
+
+        engine.tick(t0 + Duration::from_secs(1)); // Active -> Watching, camera opens
+        engine.tick(t0 + Duration::from_secs(2)); // first NoFace: streak STARTS here
+        let s = engine.tick(t0 + Duration::from_secs(8)); // streak 6s >= new dim_after 5s
+        assert_eq!(s, State::Dimmed, "new dim_after took effect");
+    }
+
+    #[test]
+    fn reload_always_leaves_the_display_lit() {
+        let idle = Arc::new(FakeIdle::new(Duration::from_secs(30)));
+        let display = SpyDisplay::new();
+        let seen = display.log();
+        let mut engine = Engine::new(
+            Config::default(),
+            idle,
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 64])),
+            Box::new(display),
+        );
+        let t0 = Instant::now();
+        engine.tick(t0);
+        engine.tick(t0 + Duration::from_secs(1));
+        engine.tick(t0 + Duration::from_secs(22)); // -> Dimmed
+        assert_eq!(engine.state(), State::Dimmed);
+
+        engine.reload(Config::default());
+        assert_eq!(seen.lock().unwrap().last(), Some(&DisplayLevel::Full));
+        assert_eq!(engine.state(), State::Active);
     }
 }
