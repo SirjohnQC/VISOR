@@ -64,8 +64,20 @@ fn main() {
 
     // The message pump must own the main thread; the engine ticks on the
     // spawned one.
-    if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver, check) {
-        tracing::error!(error = %e, "tray failed");
+    // Wrapped so that ruling F9's restore below runs even if the pump panics.
+    // Without this a panic on this thread unwinds straight past the restore:
+    // `Resolver`'s `Drop` destroys the DDC handles without powering the panel
+    // back on, and a panel switched off with SetVCPFeature(0xD6, 4) stays off
+    // after the process is gone. `AssertUnwindSafe` is honest here -- the only
+    // thing that could be observed in a torn state is `resolver`, and the very
+    // next thing we do is force it to a known one.
+    let pump = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver, check) {
+            tracing::error!(error = %e, "tray failed");
+        }
+    }));
+    if pump.is_err() {
+        tracing::error!("the message pump panicked; restoring the display before exit");
     }
 
     // Join so the engine stops ticking before we restore. `tray::run` has

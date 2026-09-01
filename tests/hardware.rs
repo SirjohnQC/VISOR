@@ -1,7 +1,9 @@
 //! Hardware integration tests. Run explicitly:
 //!   cargo test --test hardware -- --ignored --nocapture --test-threads=1
 
-use visor::actions::{ddc::DdcMonitor, monitors};
+use visor::actions::{Resolver, ddc::DdcMonitor, monitors};
+use visor::config::DisplayConfig;
+use visor::core::types::DisplayLevel;
 use visor::core::types::FaceResult;
 use visor::sense::camera::{Camera, WinRtCamera};
 
@@ -67,5 +69,41 @@ fn power_off_and_on_round_trips() {
     println!(
         "if the panel did not come back, DDC wake is unreliable here — \
               see spec §12 and set deep_after very high"
+    );
+}
+
+#[test]
+#[ignore = "requires a DDC/CI-capable monitor; visibly dims the panel"]
+fn a_rescan_while_dimmed_does_not_capture_the_dim_as_the_restore_point() {
+    // The compounding failure this guards against: `DdcMonitor::open` takes
+    // whatever brightness the panel currently reports as the restore point, so
+    // a `WM_DISPLAYCHANGE` arriving while VISOR is dimming would re-open at
+    // the dim value and never be able to get back. Repeat it and the panel
+    // walks down to black.
+    let baseline = {
+        let m = monitors::enumerate();
+        let m = m.first().expect("no monitors");
+        let d = DdcMonitor::open(m.handle).expect("monitor does not speak DDC/CI");
+        d.saved_brightness().expect("could not read brightness")
+    };
+    println!("baseline brightness: {baseline}");
+
+    let mut r = Resolver::new(&DisplayConfig::default());
+    r.apply(DisplayLevel::Dim(20));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    r.rescan();
+    r.apply(DisplayLevel::Full);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let after = {
+        let m = monitors::enumerate();
+        let m = m.first().expect("no monitors");
+        let d = DdcMonitor::open(m.handle).expect("monitor does not speak DDC/CI");
+        d.saved_brightness().expect("could not read brightness")
+    };
+    println!("brightness after dim -> rescan -> restore: {after}");
+    assert!(
+        after.abs_diff(baseline) <= 5,
+        "rescan captured the dim as the restore point: {baseline} -> {after}"
     );
 }

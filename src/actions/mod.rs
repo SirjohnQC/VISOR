@@ -58,6 +58,19 @@ pub fn broadcast_allowed(strategy: &str, monitor_count: usize) -> bool {
     strategy == "broadcast" || monitor_count <= 1
 }
 
+/// How many times `Resolver::restore` may retry a brightness write.
+///
+/// The retry exists because a panel that has just woken often rejects VCP
+/// writes for a moment. But `restore_brightness` returns `false` *immediately*
+/// and forever when the monitor never answered `GetVCPFeature(0x10)` at open
+/// time -- there is simply nothing saved to write back. Retrying that sleeps
+/// 50+100+200+400ms for nothing, on the message-pump thread, on every restore.
+/// And it is not a rare case: an unreadable brightness is exactly what Windows
+/// HDR produces, which is the configuration this machine runs.
+fn restore_attempts(has_saved: bool) -> usize {
+    if has_saved { 5 } else { 0 }
+}
+
 /// What `Engine` holds instead of the real display stack.
 ///
 /// Ruling F8: the resolver cannot live on the engine thread. Overlay windows
@@ -104,12 +117,34 @@ impl Resolver {
             powered_off: false,
         };
         r.rescan();
+        // Start from a known-lit panel. A previous VISOR killed outright --
+        // Task Manager, a crash, a forced reboot -- can have left the monitor
+        // switched off over DDC, and nothing in Windows knows: the OS is still
+        // driving the display normally, so moving the mouse will not bring it
+        // back and the user has to reach for the monitor's own power button.
+        // This process cannot tell whether that happened, so it assumes it
+        // might have. `SetVCPFeature(0xD6, 1)` on a panel that is already on is
+        // a no-op, which makes assuming the worse case free.
+        r.powered_off = true;
+        r.restore();
         r
     }
 
     /// Re-enumerate monitors and rebuild the DDC handles. Task 13 calls this
     /// on `WM_DISPLAYCHANGE`.
+    ///
+    /// Restores first, and that ordering is load-bearing. `DdcMonitor::open`
+    /// reads the panel's current brightness and keeps it as the restore point,
+    /// so re-opening while VISOR still has the panel sitting at a dim level
+    /// would capture *the dim* as the user's brightness. Every later restore
+    /// would then land there, and the next dim would take 20% of that -- a
+    /// display change every so often would walk the panel down 100 -> 20 -> 4
+    /// -> 1 with no way back short of the monitor's own OSD. Putting the panel
+    /// back to the saved value before discarding the handles that know it is
+    /// what keeps the readback honest.
     pub fn rescan(&mut self) {
+        self.restore();
+
         let chosen = monitors::select(monitors::enumerate(), &self.configured);
         self.targets = chosen
             .into_iter()
@@ -161,9 +196,17 @@ impl Resolver {
         //    woken often rejects VCP writes for a moment.
         for t in &mut self.targets {
             let Some(d) = t.ddc.as_mut() else { continue };
+            let attempts = restore_attempts(d.saved_brightness().is_some());
+            if attempts == 0 {
+                tracing::debug!(
+                    monitor = %t.description,
+                    "no saved brightness to restore; nothing to retry"
+                );
+                continue;
+            }
             let mut delay = std::time::Duration::from_millis(50);
             let mut restored = false;
-            for _ in 0..5 {
+            for _ in 0..attempts {
                 if d.restore_brightness() {
                     restored = true;
                     break;
@@ -389,6 +432,17 @@ mod resolver_tests {
             power: false,
         };
         assert_eq!(plan_for(DisplayLevel::Off, cap), Mechanism::Overlay);
+    }
+
+    #[test]
+    fn a_monitor_with_no_saved_brightness_is_not_retried() {
+        // Without this the pump thread sleeps 750ms on every single restore
+        // for a panel that can never answer -- the HDR case.
+        assert_eq!(restore_attempts(false), 0);
+        assert!(
+            restore_attempts(true) > 1,
+            "a readable panel must still get the just-woke retry"
+        );
     }
 
     #[test]
