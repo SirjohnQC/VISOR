@@ -42,4 +42,10 @@ features = [
 opt-level = "z"
 lto = true
 strip = true
-panic = "abort"
+# Deliberately NOT `panic = "abort"`. Unwinding is what lets VISOR put the
+# screen back: `main` catches a panic in the message pump, and a panic on the
+# engine thread has to unwind for `join` to return an error rather than taking
+# the process down where it stands. With `abort` every one of those restore
+# paths is dead code in the shipped binary, and a panic while the panel is off
+# over DDC leaves it off after the process is gone -- the one outcome this
+# program exists to prevent. The size it costs is worth less than that.

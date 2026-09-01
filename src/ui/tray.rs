@@ -28,6 +28,33 @@ const ICON_PX: u32 = 32;
 /// text takes over again.
 const VERDICT_HOLD: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// What draining the display-level channel revealed about the engine thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    /// Nothing left to apply; the engine is still alive.
+    Idle,
+    /// The engine dropped its `Sender` -- it returned or panicked.
+    EngineGone,
+}
+
+/// Apply every level the engine has queued, and report whether it is still there.
+///
+/// The pump used to ignore a closed channel entirely, which was survivable
+/// only for as long as the overlay was click-through. An engine thread that
+/// panics leaves the pump running forever with a stale overlay on screen and
+/// nothing left to ever change it -- now a fully opaque, hit-testing window,
+/// so the mouse would be dead too. Draining first and reporting after means
+/// the engine's parting `Full` is applied before we act on its absence.
+pub fn drain_levels(levels: &Receiver<DisplayLevel>, mut apply: impl FnMut(DisplayLevel)) -> Drain {
+    loop {
+        match levels.try_recv() {
+            Ok(level) => apply(level),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Drain::Idle,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Drain::EngineGone,
+        }
+    }
+}
+
 pub fn tooltip(s: State) -> String {
     let detail = match s {
         State::Active => "present",
@@ -170,8 +197,9 @@ pub fn run(
         // DDC VCP calls block for tens to hundreds of ms, so this is the one
         // place the pump can stall; at a 250ms poll the only visible cost is
         // tooltip latency.
-        while let Ok(level) = levels.try_recv() {
-            resolver.apply(level);
+        if drain_levels(&levels, |level| resolver.apply(level)) == Drain::EngineGone {
+            tracing::error!("engine thread is gone; restoring the display and exiting");
+            return Ok(());
         }
 
         // A camera-check result outranks the state tooltip for a few seconds:
@@ -213,6 +241,29 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::core::types::State;
+
+    #[test]
+    fn draining_levels_reports_a_dead_engine_without_losing_its_last_restore() {
+        // The engine's shutdown sends Full and *then* drops its Sender, so a
+        // drain that bailed out the moment it saw Disconnected would throw
+        // away the one message that puts the screen back -- turning the
+        // engine's death into exactly the dark screen it tried to prevent.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(DisplayLevel::Black).unwrap();
+        let mut seen = Vec::new();
+        assert_eq!(drain_levels(&rx, |l| seen.push(l)), Drain::Idle);
+        assert_eq!(seen, vec![DisplayLevel::Black]);
+
+        seen.clear();
+        tx.send(DisplayLevel::Full).unwrap();
+        drop(tx);
+        assert_eq!(drain_levels(&rx, |l| seen.push(l)), Drain::EngineGone);
+        assert_eq!(
+            seen,
+            vec![DisplayLevel::Full],
+            "the engine's parting restore must be applied before we act on its death"
+        );
+    }
 
     #[test]
     fn every_state_has_a_distinct_tooltip() {

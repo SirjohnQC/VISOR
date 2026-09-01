@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::CreateSolidBrush;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_MESSAGE, LWA_ALPHA,
-    PBT_APMRESUMEAUTOMATIC, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SetLayeredWindowAttributes,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GetWindowLongPtrW, HWND_MESSAGE,
+    IDC_ARROW, LWA_ALPHA, LoadCursorW, PBT_APMRESUMEAUTOMATIC, RegisterClassW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SetCursor, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_SETCURSOR, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 #[cfg(test)]
@@ -28,6 +29,35 @@ pub fn alpha_for(level: DisplayLevel) -> u8 {
             (((100 - p) * 255) / 100) as u8
         }
         DisplayLevel::Black | DisplayLevel::Off => 255,
+    }
+}
+
+/// Whether the overlay should stay click-through at this opacity.
+///
+/// `WS_EX_TRANSPARENT` excludes a window from hit-testing entirely, which is
+/// what makes a dimming overlay invisible to the mouse -- and also what makes
+/// it unable to hide the cursor, since `WM_SETCURSOR` only ever goes to the
+/// window the pointer actually hit-tests onto. The two are the same switch, so
+/// the choice is made per opacity: transparent while dimming, opaque and
+/// hit-testing once the screen is fully black.
+pub fn click_through_at(alpha: u8) -> bool {
+    alpha < 255
+}
+
+/// Put a normal pointer back after an opaque overlay hid it.
+///
+/// Needed because a wake is not always a mouse movement: a confirmed face
+/// restores the display with the pointer perfectly still, and nothing would
+/// then send another `WM_SETCURSOR` to undo the null cursor. The user would be
+/// left on a lit screen with no pointer, which is worse than the bug this
+/// whole mechanism fixes.
+fn restore_cursor() {
+    // SAFETY: `LoadCursorW(None, IDC_ARROW)` loads a system cursor and needs
+    // no module handle; the result is only passed back to `SetCursor`.
+    unsafe {
+        if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+            let _ = SetCursor(arrow);
+        }
     }
 }
 
@@ -66,6 +96,21 @@ pub fn take_resumed() -> bool {
 /// iteration (same thread, but outside the message dispatcher's call stack).
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        // The pointer is only ever over this window when the overlay is fully
+        // opaque -- while dimming it is WS_EX_TRANSPARENT and excluded from
+        // hit-testing, so this never fires. Claiming the message and setting a
+        // null cursor is the only way to stop Windows drawing a pointer on top
+        // of a black screen; the cursor is composited above every window, so
+        // painting cannot hide it.
+        WM_SETCURSOR => {
+            // SAFETY: setting the cursor to null is always valid; the call
+            // takes no pointers and returns the previous cursor, which we
+            // deliberately discard -- `restore_cursor` puts back a real one.
+            unsafe {
+                let _ = SetCursor(None);
+            }
+            return LRESULT(1);
+        }
         WM_DISPLAYCHANGE => {
             DISPLAY_CHANGED.store(true, Ordering::Release);
         }
@@ -220,10 +265,30 @@ impl OverlayWindow {
         HWND(self.handle as *mut core::ffi::c_void)
     }
 
+    /// Add or clear `WS_EX_TRANSPARENT` on the live window. Toggled rather
+    /// than fixed at creation because the overlay needs opposite behaviour at
+    /// its two opacities -- see `click_through_at`.
+    fn set_click_through(&self, on: bool) {
+        // SAFETY: `self.hwnd()` is a live window owned by this
+        // `OverlayWindow`; `GWL_EXSTYLE` reads and writes the extended style
+        // word, and the value written is the one just read with a single
+        // documented bit flipped.
+        unsafe {
+            let current = GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE);
+            let bit = WS_EX_TRANSPARENT.0 as isize;
+            let next = if on { current | bit } else { current & !bit };
+            if next != current {
+                SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, next);
+            }
+        }
+    }
+
     fn set_alpha(&self, alpha: u8) {
         if alpha == 0 {
             // Hide rather than destroy — instant restore is the entire
             // reason `Away` uses the overlay rather than DPMS.
+            self.set_click_through(true);
+            restore_cursor();
             // SAFETY: `self.hwnd()` was created by `create_window` and has
             // not been destroyed while this `OverlayWindow` is alive.
             unsafe {
@@ -231,6 +296,8 @@ impl OverlayWindow {
             }
             return;
         }
+        let click_through = click_through_at(alpha);
+        self.set_click_through(click_through);
         // SAFETY: `self.hwnd()` is a live window created with
         // `WS_EX_LAYERED`, so `SetLayeredWindowAttributes` is valid to call
         // on it.
@@ -239,6 +306,13 @@ impl OverlayWindow {
                 tracing::warn!(error = %e, "SetLayeredWindowAttributes failed on an overlay window");
             }
             let _ = ShowWindow(self.hwnd(), SW_SHOWNOACTIVATE);
+            if !click_through {
+                // `WM_SETCURSOR` only arrives when the pointer moves. The
+                // screen goes black under a stationary pointer far more often
+                // than not, so hide it here too rather than waiting for a
+                // movement that also happens to be the thing that ends `Away`.
+                let _ = SetCursor(None);
+            }
         }
     }
 }
@@ -397,6 +471,63 @@ mod tests {
         let one = select(all, &["DISPLAY2".to_string()]);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].handle, 2);
+    }
+
+    /// True while Windows is actually drawing a cursor anywhere on screen.
+    /// `CURSORINFO.flags` is 0 rather than `CURSOR_SHOWING` when the window
+    /// under the pointer has set the cursor to null, which is exactly the
+    /// state an opaque overlay is supposed to produce.
+    #[cfg(test)]
+    fn cursor_is_showing() -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
+        let mut ci = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `ci` is a local, fully initialized CURSORINFO with its
+        // `cbSize` set as the API requires; the call only writes into it.
+        unsafe { GetCursorInfo(&mut ci).is_ok() && ci.flags == CURSOR_SHOWING }
+    }
+
+    #[test]
+    fn the_overlay_is_click_through_until_it_is_fully_opaque() {
+        // While dimming, the user may well still be at the desk reading, so
+        // the overlay must not eat their clicks. Once it is fully black there
+        // is nothing underneath to click *at*, and owning hit-testing is the
+        // only way to own the cursor.
+        assert!(click_through_at(alpha_for(DisplayLevel::Dim(20))));
+        assert!(click_through_at(254));
+        assert!(!click_through_at(alpha_for(DisplayLevel::Black)));
+        assert!(!click_through_at(alpha_for(DisplayLevel::Off)));
+    }
+
+    #[test]
+    #[ignore = "manual: blacks the screen for a second and inspects the real cursor"]
+    fn an_opaque_overlay_hides_the_mouse_cursor() {
+        // The cursor is composited by the system above every window, topmost
+        // and layered ones included, so no amount of painting black can cover
+        // it. The only lever is owning WM_SETCURSOR for the window under the
+        // pointer -- which a WS_EX_TRANSPARENT window never gets, because it
+        // is excluded from hit-testing altogether.
+        let mut o = OverlayControl::new();
+        o.apply(DisplayLevel::Black);
+        pump_for(std::time::Duration::from_millis(600));
+        let hidden_while_black = !cursor_is_showing();
+
+        // Restore BEFORE asserting: a failed assertion must not leave the
+        // screen black with an invisible pointer.
+        o.apply(DisplayLevel::Full);
+        pump_for(std::time::Duration::from_millis(400));
+        let shown_after = cursor_is_showing();
+
+        assert!(
+            hidden_while_black,
+            "the cursor must not be drawn over a fully black overlay"
+        );
+        assert!(
+            shown_after,
+            "the cursor must come back the moment the overlay is dropped"
+        );
     }
 
     /// Run explicitly: `cargo test --lib overlay_is_visible_by_eye -- --ignored --nocapture`

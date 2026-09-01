@@ -119,11 +119,32 @@ Overlay dimming is not backlight dimming: it lays a partially transparent
 black window over the screen. On an OLED that is nearly as good, since the
 pixels themselves are what draw power and what burn in.
 
+DDC/CI is probed when VISOR starts and again on every display change or
+**Reload config**. It is occasionally flaky — a driver can refuse
+`GetPhysicalMonitorsFromHMONITOR` for a while, particularly after a VISOR was
+killed outright rather than quit — and a probe that fails means VISOR spends
+that run in overlay mode. If the log says `ddc=false` on a monitor you know
+speaks DDC/CI, **Reload config** re-probes without restarting.
+
 `SC_MONITORPOWER` is a Windows-wide broadcast, so VISOR **refuses to use it
 automatically when more than one monitor is attached** — it would blank all of
 them. With several monitors and no DDC, `Deep` degrades to the same black
 overlay as `Away`. Set `strategy = "broadcast"` in `[display]` to override
 that if blanking everything is what you want.
+
+### The pointer on a black screen
+
+While the overlay is *dimming* it is click-through: you may well still be at
+the desk, and it must not eat your clicks. Once it goes fully black it stops
+being click-through, because owning hit-testing is the only way to stop
+Windows drawing a mouse pointer on top of an otherwise black screen — the
+cursor is composited above every window, so no amount of painting can cover
+it.
+
+That means a fully black overlay does swallow mouse clicks. Moving the mouse
+is itself what ends `Away`, so the window is gone within a tick (`away_sample`,
+1s by default); the exposure is the first click of a return, and only if you
+click without moving first.
 
 ## Checking that the camera can actually see you
 
