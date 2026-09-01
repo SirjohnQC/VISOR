@@ -104,6 +104,13 @@ pub struct Resolver {
     targets: Vec<Target>,
     strategy: String,
     configured: Vec<String>,
+    /// How many monitors are *attached*, which is not the same as how many
+    /// this `Resolver` drives. `SC_MONITORPOWER` blanks every display in the
+    /// session regardless of `display.targets`, so spec §6.3's quarantine has
+    /// to be judged against what is plugged in, not against what we selected.
+    /// Counting targets instead would let someone who pinned VISOR to one
+    /// screen of two get both of them blanked.
+    attached: usize,
     /// Whether the panel is currently powered down, so restore knows to wake it.
     powered_off: bool,
 }
@@ -121,6 +128,7 @@ impl Resolver {
             targets: Vec::new(),
             strategy: cfg.strategy.clone(),
             configured: cfg.targets.clone(),
+            attached: 0,
             powered_off: false,
         };
         r.rescan();
@@ -152,7 +160,9 @@ impl Resolver {
     pub fn rescan(&mut self) {
         self.restore();
 
-        let chosen = monitors::select(monitors::enumerate(), &self.configured);
+        let all = monitors::enumerate();
+        self.attached = all.len();
+        let chosen = monitors::select(all, &self.configured);
         self.targets = chosen
             .into_iter()
             .map(|m| {
@@ -182,11 +192,18 @@ impl Resolver {
                 "display target"
             );
         }
-        tracing::info!(targets = self.targets.len(), "display targets rescanned");
+        tracing::info!(
+            targets = self.targets.len(),
+            attached = self.attached,
+            broadcast_ok = broadcast_allowed(&self.strategy, self.attached),
+            "display targets rescanned"
+        );
     }
 
+    /// Attached monitors, deliberately not `self.targets.len()` -- see the
+    /// `attached` field.
     fn monitor_count(&self) -> usize {
-        self.targets.len()
+        self.attached
     }
 
     /// Spec §6.2 — restore in a fixed order rather than by picking a mechanism.
@@ -248,7 +265,7 @@ impl Resolver {
         }
 
         let mut needs_overlay = false;
-        let count = self.targets.len();
+        let count = self.monitor_count();
         let strategy = self.strategy.clone();
         let mut powered_off = self.powered_off;
         for t in &mut self.targets {
