@@ -89,6 +89,8 @@ pub fn run(
         .build()
         .map_err(|e| VisorError::Windows(e.to_string()))?;
 
+    tracing::info!("tray icon created; VISOR is running");
+
     let menu_rx = MenuEvent::receiver();
     let mut shown = State::Active;
     let mut verdict_until: Option<std::time::Instant> = None;

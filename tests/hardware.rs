@@ -7,6 +7,33 @@ use visor::core::types::DisplayLevel;
 use visor::core::types::FaceResult;
 use visor::sense::camera::{Camera, WinRtCamera};
 
+/// Opens the first monitor over DDC/CI, or prints why not and returns `None`.
+///
+/// These are probes of what the hardware can do, not assertions that it must:
+/// a panel with no DDC/CI is a supported configuration (VISOR falls back to the
+/// overlay for dimming and to `SC_MONITORPOWER` for power), so "this monitor
+/// does not speak DDC/CI" is a result to report, not a test failure.
+fn first_ddc_monitor() -> Option<DdcMonitor> {
+    let ms = monitors::enumerate();
+    let Some(m) = ms.first() else {
+        println!("SKIP: no monitors enumerated");
+        return None;
+    };
+    match DdcMonitor::open(m.handle) {
+        Some(d) => {
+            println!("opened DDC/CI on {}", m.description);
+            Some(d)
+        }
+        None => {
+            println!("SKIP: {} does not speak DDC/CI.", m.description);
+            println!("  VISOR dims with the overlay and powers off with SC_MONITORPOWER instead.");
+            println!("  If you expected DDC: check for a DDC/CI toggle in the monitor's own");
+            println!("  on-screen menu. Most KVMs and some USB-C docks do not pass DDC through.");
+            None
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a webcam and a person in front of it"]
 fn detects_a_face_and_reports_a_plausible_ratio() {
@@ -37,11 +64,14 @@ fn detects_a_face_and_reports_a_plausible_ratio() {
 #[test]
 #[ignore = "requires a DDC/CI-capable monitor"]
 fn brightness_round_trips_and_reports_honestly() {
-    let ms = monitors::enumerate();
-    let m = ms.first().expect("no monitors");
-    let mut d = DdcMonitor::open(m.handle).expect("monitor does not speak DDC/CI");
+    let Some(mut d) = first_ddc_monitor() else {
+        return;
+    };
 
-    let saved = d.saved_brightness().expect("could not read brightness");
+    let Some(saved) = d.saved_brightness() else {
+        println!("SKIP: monitor speaks DDC/CI but will not report brightness");
+        return;
+    };
     println!("saved brightness: {saved}");
 
     let took = d.set_brightness(30);
@@ -59,9 +89,9 @@ fn brightness_round_trips_and_reports_honestly() {
 #[test]
 #[ignore = "physically powers the monitor off and on"]
 fn power_off_and_on_round_trips() {
-    let ms = monitors::enumerate();
-    let m = ms.first().expect("no monitors");
-    let mut d = DdcMonitor::open(m.handle).expect("monitor does not speak DDC/CI");
+    let Some(mut d) = first_ddc_monitor() else {
+        return;
+    };
 
     assert!(d.set_power(false), "power off rejected");
     std::thread::sleep(std::time::Duration::from_secs(5));
@@ -80,11 +110,9 @@ fn a_rescan_while_dimmed_does_not_capture_the_dim_as_the_restore_point() {
     // a `WM_DISPLAYCHANGE` arriving while VISOR is dimming would re-open at
     // the dim value and never be able to get back. Repeat it and the panel
     // walks down to black.
-    let baseline = {
-        let m = monitors::enumerate();
-        let m = m.first().expect("no monitors");
-        let d = DdcMonitor::open(m.handle).expect("monitor does not speak DDC/CI");
-        d.saved_brightness().expect("could not read brightness")
+    let Some(baseline) = first_ddc_monitor().and_then(|d| d.saved_brightness()) else {
+        println!("SKIP: needs a monitor that reports brightness over DDC/CI");
+        return;
     };
     println!("baseline brightness: {baseline}");
 
@@ -95,12 +123,9 @@ fn a_rescan_while_dimmed_does_not_capture_the_dim_as_the_restore_point() {
     r.apply(DisplayLevel::Full);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let after = {
-        let m = monitors::enumerate();
-        let m = m.first().expect("no monitors");
-        let d = DdcMonitor::open(m.handle).expect("monitor does not speak DDC/CI");
-        d.saved_brightness().expect("could not read brightness")
-    };
+    let after = first_ddc_monitor()
+        .and_then(|d| d.saved_brightness())
+        .expect("brightness was readable a moment ago");
     println!("brightness after dim -> rescan -> restore: {after}");
     assert!(
         after.abs_diff(baseline) <= 5,

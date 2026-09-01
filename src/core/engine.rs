@@ -110,7 +110,23 @@ impl Engine {
         } else {
             FaceResult::Unknown
         };
+        // At `debug` this is the only window into what the camera actually
+        // sees, tick by tick -- the difference between "it saw you and stayed
+        // put" and "it never saw anything". Gated behind camera_open so it
+        // does not spam `Unknown` for every second spent Active with the lens
+        // deliberately shut.
+        if self.camera_open {
+            tracing::debug!(?face, state = ?self.machine.state(), "probe");
+        }
+        let before = self.machine.state();
         let (state, effects) = self.machine.step(idle, face, now);
+        // The single most useful line in the log. Without it a user watching
+        // VISOR do nothing has no way to tell whether it never went idle,
+        // never saw the camera, or is sitting in a rung it will not leave --
+        // the display lines below only fire when something visibly changed.
+        if state != before {
+            tracing::info!(?before, after = ?state, ?face, idle_secs = idle.as_secs(), "state");
+        }
         self.apply(effects, state);
         state
     }
@@ -120,12 +136,18 @@ impl Engine {
             match e {
                 Effect::OpenCamera => {
                     if !self.camera_open {
+                        // Logged because it is the moment the lens actually
+                        // opens. A user who wants to audit that claim should
+                        // be able to read it off the log rather than take it
+                        // on trust.
+                        tracing::info!(?state, "camera opened");
                         self.camera.open();
                         self.camera_open = true;
                     }
                 }
                 Effect::CloseCamera => {
                     if self.camera_open {
+                        tracing::info!(?state, "camera closed");
                         self.camera.close();
                         self.camera_open = false;
                     }

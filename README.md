@@ -41,8 +41,11 @@ Both live in `%APPDATA%\VISOR\`:
   runs. Edit it, then choose **Reload config** from the tray menu (or trigger
   a display change / system resume — see below) to pick up the change without
   restarting.
-- `%APPDATA%\VISOR\` also holds the log file. Its verbosity is controlled by
-  `[log] level` in the config (`"info"` by default).
+- `%APPDATA%\VISORisor.log.YYYY-MM-DD` — the log, rotated daily, so look
+  for today's date rather than a bare `visor.log`. Verbosity is controlled by
+  `[log] level` in the config (`"info"` by default). Setting it to `"debug"`
+  adds one line per camera probe showing exactly what the detector saw, which
+  is the fastest way to answer "why didn't it dim?".
 
 A config that fails to parse or fails validation (for example
 `dim_after >= away_after`, an out-of-range `dim_level`, or a non-positive
@@ -68,6 +71,59 @@ panel goes dark.
 hardware over long sessions, and a false "you're still here" would mean a
 screen that never sleeps — exactly the wrong failure direction for a panel
 VISOR exists to protect. Turn it on once you trust your own setup.
+
+## Your first run
+
+Start `visor.exe`. Nothing visible happens except a tray icon — that is
+correct; VISOR does nothing at all while you are using the machine.
+
+Open today's log and read the first three lines. They tell you everything
+about how VISOR will behave on your hardware:
+
+```
+INFO visor: VISOR starting cfg=Config { ... }
+INFO visor::actions: display target monitor=\\.\DISPLAY1 ddc=false brightness=false
+INFO visor::ui::tray: tray icon created; VISOR is running
+```
+
+`ddc` and `brightness` are the ones that matter. See **How your monitor is
+driven** below for what each combination means.
+
+Then choose **Check camera** from the tray menu while sitting normally. That
+is the one thing worth doing before you trust VISOR to dim on you, because a
+camera that cannot see you fails silently and looks exactly like working
+correctly until your screen goes dark in your face.
+
+A sensible first session: leave the defaults, work as usual, and check the log
+afterwards for `state` lines. If VISOR dimmed while you were sitting there,
+`Check camera` will tell you why in one sentence.
+
+## How your monitor is driven
+
+VISOR picks a mechanism per operation, not per monitor, because the three
+things it wants to do have different best answers (spec §6.1):
+
+| Log line | Dimming | Powering off (`Deep`) |
+|---|---|---|
+| `ddc=true brightness=true` | real backlight dimming over DDC/CI | DDC/CI power command |
+| `ddc=true brightness=false` | black overlay at partial opacity | DDC/CI power command |
+| `ddc=false` | black overlay at partial opacity | `SC_MONITORPOWER` broadcast |
+
+`brightness=false` on a DDC-capable monitor almost always means **Windows HDR
+is on** — Windows silently ignores DDC brightness writes while it is. VISOR
+detects this by reading the value back after every write rather than trusting
+the call, so it falls through to the overlay in the same tick and you never
+see a missed dim.
+
+Overlay dimming is not backlight dimming: it lays a partially transparent
+black window over the screen. On an OLED that is nearly as good, since the
+pixels themselves are what draw power and what burn in.
+
+`SC_MONITORPOWER` is a Windows-wide broadcast, so VISOR **refuses to use it
+automatically when more than one monitor is attached** — it would blank all of
+them. With several monitors and no DDC, `Deep` degrades to the same black
+overlay as `Away`. Set `strategy = "broadcast"` in `[display]` to override
+that if blanking everything is what you want.
 
 ## Checking that the camera can actually see you
 

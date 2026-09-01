@@ -41,11 +41,18 @@ pub fn plan_for(level: DisplayLevel, cap: DdcCapability) -> Mechanism {
                 Mechanism::Overlay
             }
         }
+        // Spec §6.3 -- the fallback for a panel that will not take a DDC
+        // power command is `SC_MONITORPOWER`, not the overlay. A black overlay
+        // leaves the panel driven and lit-but-black, which is not "off" and
+        // does not save the panel anything an `Away` overlay had not already
+        // saved. `Resolver::apply` degrades this to the overlay itself when
+        // `broadcast_allowed` refuses (more than one monitor attached), so the
+        // multi-monitor quarantine still holds.
         DisplayLevel::Off => {
             if cap.power {
                 Mechanism::Ddc
             } else {
-                Mechanism::Overlay
+                Mechanism::Broadcast
             }
         }
         DisplayLevel::Full => Mechanism::Overlay,
@@ -167,6 +174,14 @@ impl Resolver {
             })
             .collect();
         self.overlay = overlay::OverlayControl::for_targets(&self.configured);
+        for t in &self.targets {
+            tracing::info!(
+                monitor = %t.description,
+                ddc = t.ddc.is_some(),
+                brightness = t.cap.brightness_confirmed,
+                "display target"
+            );
+        }
         tracing::info!(targets = self.targets.len(), "display targets rescanned");
     }
 
@@ -420,18 +435,59 @@ mod resolver_tests {
     }
 
     #[test]
-    fn off_prefers_ddc_and_degrades_to_overlay() {
+    fn off_prefers_ddc_and_degrades_to_the_broadcast_not_the_overlay() {
         let cap = DdcCapability {
             brightness_confirmed: true,
             power: true,
         };
         assert_eq!(plan_for(DisplayLevel::Off, cap), Mechanism::Ddc);
 
+        // Regression: this used to answer `Overlay`, which made
+        // `Mechanism::Broadcast` unreachable from `plan_for` and left
+        // `broadcast::set_power` as dead code. On a machine whose panel does
+        // not speak DDC/CI -- which is the machine VISOR was written on --
+        // that silently turned `Deep` into a second `Away`: a black overlay
+        // over a panel that was still fully powered.
         let cap = DdcCapability {
             brightness_confirmed: true,
             power: false,
         };
-        assert_eq!(plan_for(DisplayLevel::Off, cap), Mechanism::Overlay);
+        assert_eq!(plan_for(DisplayLevel::Off, cap), Mechanism::Broadcast);
+    }
+
+    #[test]
+    fn every_mechanism_is_reachable_from_plan_for() {
+        // The bug above was not that a branch was wrong, it was that a whole
+        // mechanism had no way to be selected. This asserts the enum and the
+        // planner cannot drift apart again.
+        let caps = [
+            DdcCapability {
+                brightness_confirmed: true,
+                power: true,
+            },
+            DdcCapability {
+                brightness_confirmed: false,
+                power: false,
+            },
+        ];
+        let levels = [
+            DisplayLevel::Full,
+            DisplayLevel::Dim(20),
+            DisplayLevel::Black,
+            DisplayLevel::Off,
+        ];
+        let mut seen = Vec::new();
+        for c in caps {
+            for l in levels {
+                let m = plan_for(l, c);
+                if !seen.contains(&m) {
+                    seen.push(m);
+                }
+            }
+        }
+        for m in [Mechanism::Ddc, Mechanism::Overlay, Mechanism::Broadcast] {
+            assert!(seen.contains(&m), "{m:?} is unreachable from plan_for");
+        }
     }
 
     #[test]
