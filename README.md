@@ -41,7 +41,7 @@ Both live in `%APPDATA%\VISOR\`:
   runs. Edit it, then choose **Reload config** from the tray menu (or trigger
   a display change / system resume — see below) to pick up the change without
   restarting.
-- `%APPDATA%\VISORisor.log.YYYY-MM-DD` — the log, rotated daily, so look
+- `%APPDATA%\VISOR\visor.log.YYYY-MM-DD` — the log, rotated daily, so look
   for today's date rather than a bare `visor.log`. Verbosity is controlled by
   `[log] level` in the config (`"info"` by default). Setting it to `"debug"`
   adds one line per camera probe showing exactly what the detector saw, which
@@ -82,7 +82,7 @@ about how VISOR will behave on your hardware:
 
 ```
 INFO visor: VISOR starting cfg=Config { ... }
-INFO visor::actions: display target monitor=\\.\DISPLAY1 ddc=false brightness=false
+INFO visor::actions: display target monitor=\\.\DISPLAY1 ddc=true brightness=true
 INFO visor::ui::tray: tray icon created; VISOR is running
 ```
 
