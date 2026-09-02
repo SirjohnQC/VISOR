@@ -9,6 +9,7 @@ pub struct Config {
     pub presence: PresenceConfig,
     pub camera: CameraConfig,
     pub display: DisplayConfig,
+    pub ui: UiConfig,
     pub log: LogConfig,
 }
 
@@ -47,6 +48,27 @@ pub struct DisplayConfig {
     pub strategy: String,
     pub dim_level: u8,
     pub hold_awake_while_present: bool,
+}
+
+/// Spec §7 addition: how the tuning window looks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// `"dark"` (default), `"light"`, or `"oled"`.
+    ///
+    /// `oled` is a true-black ground rather than a darker grey: on an OLED
+    /// `#000000` switches the subpixels off, where the default dark theme
+    /// leaves every one of them lit. It is offered rather than imposed
+    /// because pure black with high-contrast text haloes badly on an LCD.
+    pub theme: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: "dark".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

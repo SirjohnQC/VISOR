@@ -3,6 +3,8 @@ use crate::actions::overlay;
 use crate::core::engine::CheckSlot;
 use crate::core::types::{Command, DisplayLevel, State};
 use crate::error::{Result, VisorError};
+use crate::ui::theme::Theme;
+use crate::ui::window::TuningWindow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -94,6 +96,7 @@ pub fn run(
     levels: Receiver<DisplayLevel>,
     resolver: &mut Resolver,
     check: CheckSlot,
+    theme: Theme,
 ) -> Result<()> {
     let win = |e: tray_icon::BadIcon| VisorError::Windows(e.to_string());
     // Slate for normal operation, amber for the Degraded warning.
@@ -105,8 +108,9 @@ pub fn run(
     let resume = MenuItem::new("Resume", true, None);
     let reload = MenuItem::new("Reload config", true, None);
     let check_cam = MenuItem::new("Check camera", true, None);
+    let tuning = MenuItem::new("Tuning window…", true, None);
     let quit = MenuItem::new("Quit", true, None);
-    menu.append_items(&[&pause, &resume, &check_cam, &reload, &quit])
+    menu.append_items(&[&tuning, &pause, &resume, &check_cam, &reload, &quit])
         .map_err(|e| VisorError::Windows(e.to_string()))?;
 
     let tray = TrayIconBuilder::new()
@@ -130,6 +134,14 @@ pub fn run(
     // it at the end of this function destroys it.
     let _broadcast_window = overlay::create_broadcast_window();
 
+    // Ruling F7 again: a top-level window belongs to the thread that pumps,
+    // and this is that thread. Held for the whole loop -- closing the window
+    // only hides it, so re-opening is instant and the D2D device survives.
+    let tuning_window = TuningWindow::create(theme);
+    if tuning_window.is_none() {
+        tracing::warn!("tuning window unavailable; VISOR continues without it");
+    }
+
     loop {
         // Pump Win32 messages — tray-icon delivers its events through them.
         let mut msg = MSG::default();
@@ -151,6 +163,13 @@ pub fn run(
                 Some(Command::Resume)
             } else if ev.id == *reload.id() {
                 Some(Command::Reload)
+            } else if ev.id == *tuning.id() {
+                // Handled entirely on this thread: the window is ours, and the
+                // engine has no idea it exists.
+                if let Some(w) = tuning_window.as_ref() {
+                    w.toggle();
+                }
+                None
             } else if ev.id == *check_cam.id() {
                 Some(Command::CheckCamera)
             } else if ev.id == *quit.id() {
@@ -160,6 +179,14 @@ pub fn run(
             };
             if let Some(c) = cmd {
                 if c == Command::Reload {
+                    // Re-read the theme too: it lives in the same file, and a
+                    // reload that ignored it would make the setting look broken.
+                    let fresh = crate::config::Config::load_or_default(
+                        &crate::config::Config::default_path(),
+                    );
+                    if let Some(w) = tuning_window.as_ref() {
+                        w.set_theme(Theme::parse(&fresh.ui.theme));
+                    }
                     // Ruling F8: the `Resolver` lives on this thread, not the
                     // engine's, so a reload has to be actioned here too —
                     // `Engine::reload` cannot reach it.

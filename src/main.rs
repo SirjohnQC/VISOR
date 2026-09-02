@@ -28,6 +28,9 @@ fn main() {
     let cfg = Config::load_or_default(&path);
     tracing::info!(?cfg, "VISOR starting");
 
+    // Read before `cfg` is moved onto the engine thread.
+    let theme = visor::ui::theme::Theme::parse(&cfg.ui.theme);
+
     // Real idle source; camera and display are real too as of task 12.
     let idle: Arc<dyn visor::sense::idle::IdleSource + Sync> = Arc::new(Win32Idle::new());
 
@@ -72,7 +75,7 @@ fn main() {
     // thing that could be observed in a torn state is `resolver`, and the very
     // next thing we do is force it to a known one.
     let pump = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver, check) {
+        if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver, check, theme) {
             tracing::error!(error = %e, "tray failed");
         }
     }));
