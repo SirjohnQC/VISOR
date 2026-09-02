@@ -35,8 +35,16 @@ features = [
     "Media_Capture_Frames",
     "Media_FaceAnalysis",
     "Graphics_Imaging",
+    "Storage_Streams",
     "Foundation_Collections",
 ]
+
+[dev-dependencies]
+# Already a runtime dependency; listed again so the integration tests can turn
+# logging on. Hardware tests fail for reasons only the adapter knows (a WinRT
+# HRESULT, a refused buffer), and without a subscriber those reasons are
+# written to a logger nobody installed. No new crate enters the lock file.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = "z"

@@ -1,13 +1,15 @@
 use crate::core::types::FaceResult;
+use crate::sense::preview::{FaceBox, PreviewFrame, tighten_rows};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
+use windows::Graphics::Imaging::{BitmapBufferAccessMode, BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Capture::Frames::{MediaFrameReader, MediaFrameSource, MediaFrameSourceKind};
 use windows::Media::Capture::{
     MediaCapture, MediaCaptureInitializationSettings, MediaCaptureMemoryPreference,
     StreamingCaptureMode,
 };
 use windows::Media::FaceAnalysis::FaceDetector;
+use windows::Storage::Streams::{Buffer, DataReader};
 use windows::core::HSTRING;
 
 /// Deliberately **not** `Camera: Send`. `WinRtCamera` holds a `MediaCapture`,
@@ -27,6 +29,21 @@ pub trait Camera {
     fn close(&mut self);
     /// Grab one frame and detect. Returns `Unknown` on any failure.
     fn probe(&mut self) -> FaceResult;
+
+    /// Turn preview capture on or off.
+    ///
+    /// Off by default, and deliberately so: with preview off `probe` does
+    /// exactly the work it did before the tuning window existed, so the
+    /// background cost of VISOR is unchanged for the 99% of its life when
+    /// nobody is looking at a window. Copying a frame out is only worth
+    /// paying for while something is drawing it.
+    fn set_preview(&mut self, _on: bool) {}
+
+    /// The most recent preview frame, consumed. `None` unless preview is on
+    /// and a frame was captured since the last call.
+    fn take_preview(&mut self) -> Option<PreviewFrame> {
+        None
+    }
 }
 
 /// Local webcam presence detection via `Windows.Media.Capture` and
@@ -46,6 +63,8 @@ pub struct WinRtCamera {
     reader: Option<MediaFrameReader>,
     detector: Option<FaceDetector>,
     format: BitmapPixelFormat,
+    preview: bool,
+    last_preview: Option<PreviewFrame>,
 }
 
 impl WinRtCamera {
@@ -57,6 +76,8 @@ impl WinRtCamera {
             capture: None,
             reader: None,
             detector: None,
+            preview: false,
+            last_preview: None,
             format: BitmapPixelFormat::Gray8,
         }
     }
@@ -135,21 +156,124 @@ impl WinRtCamera {
             .expect("detector is set whenever reader is");
         let faces = detector.DetectFacesAsync(&converted)?.get()?;
         let count = faces.Size()? as u8;
-        if count == 0 {
-            return Ok(FaceResult::NoFace);
-        }
 
         // largest_ratio is FaceBox.Height / frame height (spec §4.2). Do not
         // filter by ratio here -- `min_face_ratio` is applied by the state
-        // machine, not the camera adapter.
+        // machine, not the camera adapter. The rectangles are collected in the
+        // same pass because the preview needs all four numbers, not just the
+        // ratio, to draw a box around the person.
         let mut largest = 0.0f32;
+        let mut boxes = Vec::new();
         for face in &faces {
             let bounds = face.FaceBox()?;
             largest = largest.max(bounds.Height as f32 / height);
+            if self.preview {
+                boxes.push(FaceBox {
+                    x: bounds.X,
+                    y: bounds.Y,
+                    w: bounds.Width,
+                    h: bounds.Height,
+                });
+            }
+        }
+
+        // Captured BEFORE the no-face return below: "the camera works but
+        // sees nobody" is a state the window has to be able to show video in,
+        // and it is the state a user tuning their threshold sits in most.
+        if self.preview {
+            match Self::grab_preview(&converted, boxes) {
+                Ok(frame) => self.last_preview = Some(frame),
+                // A preview failure must never change what the machine is
+                // told about presence -- the window going blank is survivable,
+                // the screen blanking in the user's face is not.
+                Err(e) => tracing::debug!(error = %e, "preview frame capture failed"),
+            }
+        }
+
+        if count == 0 {
+            return Ok(FaceResult::NoFace);
         }
         Ok(FaceResult::Face {
             count,
             largest_ratio: largest,
+        })
+    }
+
+    /// Copy the already-converted `Gray8` bitmap out as plain bytes.
+    ///
+    /// The detector requires `Gray8`, so this buffer had to be built anyway --
+    /// the preview is a copy of it rather than a second conversion. That is
+    /// also what the window wants to draw: luminance, not colour.
+    fn grab_preview(
+        gray: &SoftwareBitmap,
+        faces: Vec<FaceBox>,
+    ) -> windows::core::Result<PreviewFrame> {
+        let width = gray.PixelWidth()? as u32;
+        let height = gray.PixelHeight()? as u32;
+
+        // Walk the bitmap's planes. The detector does not necessarily hand
+        // back Gray8: `GetSupportedBitmapPixelFormats` reports NV12 first on
+        // this hardware, which is planar -- a full-size luminance plane
+        // followed by a half-height interleaved chroma plane. The buffer has
+        // to be big enough for every plane or `CopyToBuffer` refuses with
+        // MF_E_BUFFERTOOSMALL, but only plane 0 is ever drawn: it is
+        // luminance in NV12 and in Gray8 alike, which is precisely the grey
+        // picture the preview wants.
+        let (start_index, stride, total) = {
+            let locked = gray.LockBuffer(BitmapBufferAccessMode::Read)?;
+            let mut first: Option<(usize, usize)> = None;
+            let mut total = 0usize;
+            for plane in 0..4 {
+                let Ok(d) = locked.GetPlaneDescription(plane) else {
+                    break;
+                };
+                let end = d.StartIndex as usize + (d.Stride as usize) * (d.Height as usize);
+                total = total.max(end);
+                if plane == 0 {
+                    first = Some((d.StartIndex as usize, d.Stride as usize));
+                }
+            }
+            let _ = locked.Close();
+            match first {
+                Some((s, st)) if st >= width as usize && total > 0 => (s, st, total),
+                // No usable plane description means no honest way to index the
+                // bytes. Fail toward no preview -- the window keeps its last
+                // good frame -- rather than drawing a sheared guess.
+                _ => {
+                    return Err(windows::core::Error::new(
+                        windows::Win32::Foundation::E_FAIL,
+                        "bitmap did not describe a usable luminance plane",
+                    ));
+                }
+            }
+        };
+
+        let buffer = Buffer::Create(total as u32)?;
+        // `Buffer::Create` sets CAPACITY but leaves Length at 0, and
+        // `CopyToBuffer` validates against Length, so without this the copy
+        // fails however much room was reserved.
+        buffer.SetLength(total as u32)?;
+        gray.CopyToBuffer(&buffer)?;
+        let reader = DataReader::FromBuffer(&buffer)?;
+        let len = reader.UnconsumedBufferLength()? as usize;
+        let mut bytes = vec![0u8; len];
+        reader.ReadBytes(&mut bytes)?;
+
+        let luma = bytes
+            .get(start_index..)
+            .and_then(|plane| tighten_rows(plane, stride, width, height))
+            .ok_or_else(|| {
+                windows::core::Error::new(
+                    windows::Win32::Foundation::E_FAIL,
+                    "preview buffer smaller than the frame it describes",
+                )
+            })?;
+
+        Ok(PreviewFrame {
+            width,
+            height,
+            luma,
+            faces,
         })
     }
 }
@@ -172,6 +296,21 @@ impl Camera for WinRtCamera {
             let _ = capture.Close();
         }
         self.detector = None;
+        // A frame from before the lens shut is not a preview of anything.
+        // Dropping it here is what stops the window showing a stale picture
+        // of the user next to a chip that says the camera is off.
+        self.last_preview = None;
+    }
+
+    fn set_preview(&mut self, on: bool) {
+        self.preview = on;
+        if !on {
+            self.last_preview = None;
+        }
+    }
+
+    fn take_preview(&mut self) -> Option<PreviewFrame> {
+        self.last_preview.take()
     }
 
     /// Never returns an error -- a failure is `Unknown`, which the state

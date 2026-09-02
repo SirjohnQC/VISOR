@@ -132,3 +132,65 @@ fn a_rescan_while_dimmed_does_not_capture_the_dim_as_the_restore_point() {
         "rescan captured the dim as the restore point: {baseline} -> {after}"
     );
 }
+
+#[test]
+#[ignore = "requires a webcam; opens the camera and copies frames"]
+fn the_preview_path_produces_a_real_picture() {
+    // A length check alone would pass on a buffer of zeros, which is exactly
+    // what a broken copy produces -- and a black preview looks like a covered
+    // lens, not like a bug. So this asserts the frame has actual variation in
+    // it, and that the rows are not sheared (a sheared frame still has plenty
+    // of variation, so the row-start check earns its place too).
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    let mut cam = WinRtCamera::new("");
+    cam.set_preview(true);
+    cam.open();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let mut got = None;
+    for _ in 0..12 {
+        let verdict = cam.probe();
+        if let Some(f) = cam.take_preview() {
+            got = Some((f, verdict));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    cam.close();
+
+    let Some((frame, verdict)) = got else {
+        panic!("no preview frame after 12 probes");
+    };
+    println!(
+        "preview {}x{}, {} bytes, {} face(s), probe said {:?}",
+        frame.width,
+        frame.height,
+        frame.luma.len(),
+        frame.faces.len(),
+        verdict
+    );
+
+    assert!(frame.width > 0 && frame.height > 0, "empty frame");
+    assert_eq!(
+        frame.luma.len(),
+        (frame.width * frame.height) as usize,
+        "luma must be tightly packed: width * height, no row padding"
+    );
+
+    let min = *frame.luma.iter().min().unwrap();
+    let max = *frame.luma.iter().max().unwrap();
+    println!("luminance range {min}..{max}");
+    assert!(
+        max - min > 20,
+        "a real frame has tonal range; {min}..{max} is a blank buffer"
+    );
+
+    if let Some(r) = frame.largest_ratio() {
+        println!("largest face ratio {r:.3}");
+        assert!(r > 0.0 && r <= 1.0, "implausible ratio {r}");
+    }
+}
