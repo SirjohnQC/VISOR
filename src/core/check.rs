@@ -71,7 +71,7 @@ impl CameraVerdict {
 /// A threshold with headroom below what was actually measured, so that normal
 /// shifting in the chair does not drop the user under it. Floored so a wildly
 /// small reading cannot suggest a value that would match noise.
-fn suggested_ratio(best: f32) -> f32 {
+pub fn suggested_ratio(best: f32) -> f32 {
     (best * 0.7).max(0.03)
 }
 
