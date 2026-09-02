@@ -167,6 +167,48 @@ impl Config {
         }
     }
 
+    /// Write the config back to disk.
+    ///
+    /// Validated first: the tuning window clamps as you drag, but a value that
+    /// somehow arrived out of order must not be written, because
+    /// `load_or_default` would then silently fall back to defaults on the next
+    /// start and the user would find every setting reverted with no
+    /// explanation.
+    ///
+    /// **This rewrites the whole file**, so hand-written comments and any
+    /// ordering the user chose are lost. Preserving them needs a
+    /// format-preserving TOML parser, which is a new dependency, and the
+    /// allowlist is closed deliberately — it is what makes "no network code"
+    /// checkable from `Cargo.lock`. The file is machine-written on first run
+    /// anyway, so the cost is small, but it is a real cost and not an
+    /// oversight.
+    ///
+    /// Writes through a temporary file and renames: a half-written config is
+    /// a config that fails to parse, and this program is supposed to survive
+    /// being killed at any moment.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| VisorError::Config(format!("could not serialise config: {e}")))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| VisorError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text).map_err(|source| VisorError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp, path).map_err(|source| VisorError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        tracing::info!(path = %path.display(), "config saved");
+        Ok(())
+    }
+
     /// Spec §7: dim_after < away_after < deep_after, all durations positive,
     /// min_face_ratio in (0,1), dim_level in 1..=99.
     pub fn validate(&self) -> Result<()> {
@@ -237,6 +279,42 @@ mod tests {
         assert_eq!(c.presence.deep_after, Duration::from_secs(600));
         // unspecified fields fall back to defaults
         assert_eq!(c.presence.away_after, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn a_saved_config_reloads_to_exactly_what_was_saved() {
+        // The tuning window writes through this on every drag release. If a
+        // round trip lost or altered anything, a setting would appear to take
+        // and then quietly revert on the next start.
+        let dir = std::env::temp_dir().join("visor-save-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.presence.min_face_ratio = 0.085;
+        cfg.presence.dim_after = Duration::from_secs(37);
+        cfg.presence.away_after = Duration::from_secs(95);
+        cfg.display.dim_level = 35;
+        cfg.ui.theme = "oled".to_string();
+
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load_or_default(&path), cfg);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_invalid_config_is_refused_rather_than_written() {
+        // Writing it would be worse than refusing: load_or_default would fall
+        // back to defaults next start, and the user would find EVERY setting
+        // reverted with nothing to explain why.
+        let dir = std::env::temp_dir().join("visor-save-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+
+        let mut cfg = Config::default();
+        cfg.presence.dim_after = Duration::from_secs(600); // past away_after
+        assert!(cfg.save(&path).is_err());
+        assert!(!path.exists(), "nothing may be left on disk");
     }
 
     #[test]

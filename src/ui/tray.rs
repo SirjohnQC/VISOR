@@ -8,6 +8,7 @@ use crate::ui::window::{TuningWindow, WindowStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -272,7 +273,31 @@ pub fn run(
                 monitor,
                 ddc,
                 brightness_confirmed: confirmed,
+                idle_grace: cfg.presence.idle_grace.as_secs_f32(),
+                dim_after: cfg.presence.dim_after.as_secs_f32(),
+                away_after: cfg.presence.away_after.as_secs_f32(),
+                deep_after: cfg.presence.deep_after.as_secs_f32(),
             });
+
+            // Drag released: write it back and tell the engine to re-read.
+            if let Some(e) = w.take_edits() {
+                cfg.presence.min_face_ratio = e.threshold;
+                cfg.display.dim_level = e.dim_level;
+                cfg.presence.idle_grace = Duration::from_secs_f32(e.idle_grace);
+                cfg.presence.dim_after = Duration::from_secs_f32(e.dim_after);
+                cfg.presence.away_after = Duration::from_secs_f32(e.away_after);
+                cfg.presence.deep_after = Duration::from_secs_f32(e.deep_after);
+                match cfg.save(&crate::config::Config::default_path()) {
+                    Ok(()) => {
+                        if tx.send(Command::Reload).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "could not save the tuning changes")
+                    }
+                }
+            }
         }
 
         // A camera-check result outranks the state tooltip for a few seconds:

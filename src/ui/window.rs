@@ -18,6 +18,7 @@
 
 use crate::core::types::State;
 use crate::sense::preview::PreviewFrame;
+use crate::ui::controls::{Axis, Scale, TIME_SNAPS, clamp_above, clamp_below, snap};
 use crate::ui::signal::{
     CameraStatus, Confirmation, Envelope, SMOOTH_ALPHA, SignalState, classify, quantise, smooth,
     suggested,
@@ -42,11 +43,13 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
     GetWindowLongPtrW, HMENU, IDC_ARROW, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW,
-    SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_NCCREATE, WM_PAINT,
-    WM_SIZE, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_PAINT, WM_SIZE, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW,
+    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 use windows::core::PCWSTR;
 
@@ -85,6 +88,10 @@ pub struct WindowStatus {
     pub monitor: String,
     pub ddc: bool,
     pub brightness_confirmed: bool,
+    pub idle_grace: f32,
+    pub dim_after: f32,
+    pub away_after: f32,
+    pub deep_after: f32,
 }
 
 impl Default for WindowStatus {
@@ -96,7 +103,81 @@ impl Default for WindowStatus {
             monitor: String::new(),
             ddc: false,
             brightness_confirmed: false,
+            idle_grace: 30.0,
+            dim_after: 20.0,
+            away_after: 45.0,
+            deep_after: 900.0,
         }
+    }
+}
+
+/// The six values the window edits, in the units the axes work in: a ratio,
+/// a percentage, and four durations in seconds.
+///
+/// Held separately from [`WindowStatus`] because these are what the user is
+/// currently dragging, and a status push arriving mid-drag must not yank the
+/// handle out from under them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Editable {
+    pub threshold: f32,
+    pub dim_level: u8,
+    pub idle_grace: f32,
+    pub dim_after: f32,
+    pub away_after: f32,
+    pub deep_after: f32,
+}
+
+/// What the mouse currently owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grab {
+    Threshold,
+    DimLevel,
+    IdleGrace,
+    DimAfter,
+    AwayAfter,
+    DeepAfter,
+}
+
+/// The sequence rail's pixel run. Inset from the track so a handle at either
+/// extreme is not half outside it.
+const RAIL_LO: f32 = 29.0;
+const RAIL_HI: f32 = 391.0;
+/// Handle lane and track, for hit-testing.
+const RAIL_TOP: f32 = 455.0;
+const RAIL_BOTTOM: f32 = 505.0;
+/// Smallest gap between two ladder thresholds, in seconds.
+const LADDER_GAP: f32 = 5.0;
+
+fn rail_axis() -> Axis {
+    Axis {
+        lo: RAIL_LO,
+        hi: RAIL_HI,
+        scale: Scale::Log {
+            t0: 5.0,
+            t1: 3600.0,
+        },
+    }
+}
+
+fn dim_axis() -> Axis {
+    Axis {
+        lo: 74.0,
+        hi: 330.0,
+        scale: Scale::Linear {
+            min: 1.0,
+            max: 99.0,
+        },
+    }
+}
+
+fn gauge_axis(top: f32, bottom: f32) -> Axis {
+    Axis {
+        lo: bottom,
+        hi: top,
+        scale: Scale::Linear {
+            min: 0.0,
+            max: GAUGE_TOP,
+        },
     }
 }
 
@@ -238,6 +319,16 @@ pub struct TuningWindow {
     confirmation: RefCell<Confirmation>,
     smoothed: Cell<Option<f32>>,
     shown: Cell<Option<f32>>,
+    /// What the user is editing. Seeded from status, then owned by the window
+    /// until it is saved.
+    edits: Cell<Editable>,
+    grab: Cell<Option<Grab>>,
+    /// Set on drag release; the pump drains it and writes config.toml.
+    dirty: Cell<bool>,
+    /// The gauge's pixel extent from the last paint. The gauge follows the
+    /// video, which is only known once a frame has been drawn, so hit-testing
+    /// has to read what the painter last decided rather than guess.
+    gauge_extent: Cell<(f32, f32)>,
     /// Set by a click, drained by the pump. The window cannot talk to the
     /// engine itself -- it does not own the command channel -- so it leaves a
     /// note and `ui::tray` posts it.
@@ -283,6 +374,17 @@ impl TuningWindow {
             confirmation: RefCell::new(Confirmation::new()),
             smoothed: Cell::new(None),
             shown: Cell::new(None),
+            edits: Cell::new(Editable {
+                threshold: 0.15,
+                dim_level: 20,
+                idle_grace: 30.0,
+                dim_after: 20.0,
+                away_after: 45.0,
+                deep_after: 900.0,
+            }),
+            grab: Cell::new(None),
+            dirty: Cell::new(false),
+            gauge_extent: Cell::new((PLATE.1, PLATE.3)),
             pending_preview: Cell::new(None),
         });
 
@@ -382,10 +484,142 @@ impl TuningWindow {
                 || cur.dim_level != status.dim_level
         };
         if changed {
+            // Never reseed while the user has hold of something, or the handle
+            // jumps out from under the mouse. Nor while there are unsaved
+            // edits: the pump is about to write them, and the config it is
+            // pushing is the one they replace.
+            if self.grab.get().is_none() && !self.dirty.get() {
+                self.edits.set(Editable {
+                    threshold: status.threshold,
+                    dim_level: status.dim_level,
+                    idle_grace: status.idle_grace,
+                    dim_after: status.dim_after,
+                    away_after: status.away_after,
+                    deep_after: status.deep_after,
+                });
+            }
             *self.status.borrow_mut() = status;
             if self.is_visible() {
                 self.invalidate();
             }
+        }
+    }
+
+    /// The current edits, and whether they need saving. Drained by the pump.
+    pub fn take_edits(&self) -> Option<Editable> {
+        if self.dirty.replace(false) {
+            Some(self.edits.get())
+        } else {
+            None
+        }
+    }
+
+    /// Which handle, if any, is under this point.
+    ///
+    /// Ordered deliberately: the rail markers are tested before the track they
+    /// sit on, so grabbing a handle never registers as a click on the bar
+    /// underneath it.
+    fn hit_handle(&self, x: f32, y: f32) -> Option<Grab> {
+        let e = self.edits.get();
+        let (gt, gb) = self.gauge_extent.get();
+
+        // Gauge threshold: a wide band, because the grip is only 10px tall and
+        // the spec asks for a 44px target.
+        let ty = gauge_axis(gt, gb).pixel_of(e.threshold);
+        if (350.0..=400.0).contains(&x) && (y - ty).abs() <= 14.0 {
+            return Some(Grab::Threshold);
+        }
+
+        if (RAIL_TOP..=RAIL_BOTTOM).contains(&y) {
+            let a = rail_axis();
+            let mut best: Option<(f32, Grab)> = None;
+            for (value, which) in [
+                (e.idle_grace, Grab::IdleGrace),
+                (e.idle_grace + e.dim_after, Grab::DimAfter),
+                (e.idle_grace + e.away_after, Grab::AwayAfter),
+                (e.idle_grace + e.deep_after, Grab::DeepAfter),
+            ] {
+                let d = (a.pixel_of(value) - x).abs();
+                if d <= 11.0 && best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, which));
+                }
+            }
+            if let Some((_, which)) = best {
+                return Some(which);
+            }
+        }
+
+        if (68.0..=336.0).contains(&x) && (542.0..=570.0).contains(&y) {
+            return Some(Grab::DimLevel);
+        }
+        None
+    }
+
+    /// Move whatever is held to follow the pointer.
+    fn drag_to(&self, x: f32, y: f32) {
+        let Some(grab) = self.grab.get() else { return };
+        let mut e = self.edits.get();
+        let a = rail_axis();
+
+        match grab {
+            Grab::Threshold => {
+                let (gt, gb) = self.gauge_extent.get();
+                // Clamped to what the gauge can actually show. Below 0.02 is
+                // noise, and above 0.60 is off the top of the scale.
+                e.threshold = gauge_axis(gt, gb).value_at(y).clamp(0.02, GAUGE_TOP);
+            }
+            Grab::DimLevel => {
+                let v = dim_axis().value_at(x).round().clamp(1.0, 99.0);
+                // 5% stops, because nobody wants to hunt for 37%.
+                e.dim_level = ((v / 5.0).round() * 5.0).clamp(1.0, 99.0) as u8;
+            }
+            Grab::IdleGrace => {
+                // Markers 2-4 are stored RELATIVE to this one, so moving it
+                // slides the whole sequence rigidly. That falls out of the
+                // representation rather than needing to be arranged.
+                e.idle_grace = snap(a.value_at(x), &TIME_SNAPS, &a, 7.0).clamp(5.0, 3600.0);
+            }
+            Grab::DimAfter | Grab::AwayAfter | Grab::DeepAfter => {
+                let absolute = snap(a.value_at(x), &TIME_SNAPS, &a, 7.0);
+                let rel = (absolute - e.idle_grace).max(1.0);
+                match grab {
+                    Grab::DimAfter => {
+                        e.dim_after = clamp_below(rel, e.away_after, LADDER_GAP).max(1.0)
+                    }
+                    Grab::AwayAfter => {
+                        e.away_after = clamp_above(rel, e.dim_after, LADDER_GAP);
+                        e.away_after = clamp_below(e.away_after, e.deep_after, LADDER_GAP);
+                    }
+                    _ => e.deep_after = clamp_above(rel, e.away_after, LADDER_GAP),
+                }
+            }
+        }
+        self.edits.set(e);
+        self.invalidate();
+    }
+
+    fn begin_drag(&self, grab: Grab) {
+        self.grab.set(Some(grab));
+        // SAFETY: capture is released on WM_LBUTTONUP; `self.hwnd` is live.
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+    }
+
+    fn end_drag(&self) {
+        if self.grab.take().is_some() {
+            self.dirty.set(true);
+            // A new line deserves a fresh verdict: the old confirmation was
+            // about a threshold that no longer exists.
+            self.envelope.borrow_mut().clear();
+            self.confirmation
+                .borrow_mut()
+                .restart(std::time::Instant::now());
+            // SAFETY: paired with the SetCapture in `begin_drag`.
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            self.invalidate();
         }
     }
 
@@ -473,6 +707,10 @@ impl TuningWindow {
     fn on_click(&self, x: f32, y: f32) {
         if hit(self.preview_btn(), x, y) {
             self.pending_preview.set(Some(!self.preview_on.get()));
+            return;
+        }
+        if let Some(g) = self.hit_handle(x, y) {
+            self.begin_drag(g);
         }
     }
 
@@ -800,8 +1038,12 @@ impl TuningWindow {
 
             // ---- gauge --------------------------------------------------------
             let (gt, gb) = extent;
-            let span = (gb - gt).max(1.0);
-            let y_of = |v: f32| gb - (v / GAUGE_TOP).clamp(0.0, 1.0) * span;
+            // Remember it: the gauge follows the video, so hit-testing has to
+            // read what the painter last decided rather than guess.
+            self.gauge_extent.set((gt, gb));
+            let ed = self.edits.get();
+            let gauge = gauge_axis(gt, gb);
+            let y_of = |v: f32| gauge.pixel_of(v);
 
             let track = D2D1_ROUNDED_RECT {
                 rect: rect(362.0, gt, 382.0, gb),
@@ -836,7 +1078,7 @@ impl TuningWindow {
             }
 
             // The user's line. Neutral: it is not a measurement.
-            let ty = y_of(st.threshold);
+            let ty = y_of(ed.threshold);
             t.FillRectangle(&rect(354.0, ty - 0.75, 398.0, ty + 0.75), &b_t1);
             let grip = D2D1_ROUNDED_RECT {
                 rect: rect(356.0, ty - 5.0, 388.0, ty + 5.0),
@@ -857,13 +1099,13 @@ impl TuningWindow {
                 &b_accent,
             );
             text(
-                &format!("/ {:.2}", st.threshold),
+                &format!("/ {:.2}", ed.threshold),
                 &r.fonts.numeral,
                 rect(100.0, 353.0, CONTENT_R, 392.0),
                 &b_t3,
             );
             text(
-                &verdict(signal, low, st.threshold),
+                &verdict(signal, low, ed.threshold),
                 &r.fonts.body,
                 rect(MARGIN, 392.0, CONTENT_R, 414.0),
                 &b_t2,
@@ -876,7 +1118,7 @@ impl TuningWindow {
                 rect(MARGIN, 424.0, CONTENT_R, 440.0),
                 &b_t3,
             );
-            self.draw_rail(t, p, &b_hair, &b_strong, st.dim_level);
+            self.draw_rail(t, p, &b_hair, &b_strong, &b_t1, &b_t3, ed);
 
             // ---- dim level ----------------------------------------------------
             text(
@@ -890,13 +1132,20 @@ impl TuningWindow {
                 radiusX: 4.0,
                 radiusY: 4.0,
             };
-            if let Some(b_dim) = brush(crate::ui::theme::dim_fill(p, st.dim_level)) {
+            if let Some(b_dim) = brush(crate::ui::theme::dim_fill(p, ed.dim_level)) {
                 t.FillRoundedRectangle(&bar, &b_dim);
             }
             t.DrawRoundedRectangle(&bar, &b_hair, 1.0, None);
+            let dx = dim_axis().pixel_of(ed.dim_level as f32);
+            let dh = D2D1_ROUNDED_RECT {
+                rect: rect(dx - 6.0, 549.0, dx + 6.0, 563.0),
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            t.FillRoundedRectangle(&dh, &b_t1);
             align(&r.fonts.body_strong, DWRITE_TEXT_ALIGNMENT_TRAILING);
             text(
-                &format!("{}%", st.dim_level),
+                &format!("{}%", ed.dim_level),
                 &r.fonts.body_strong,
                 rect(300.0, 547.0, CONTENT_R, 566.0),
                 &b_t1,
@@ -948,19 +1197,29 @@ impl TuningWindow {
         }
     }
 
-    /// The sequence rail: the segmented track whose fill brightness *is* the
-    /// screen brightness at that point on the timeline.
+    /// The sequence rail: one axis, four markers, and a segmented track whose
+    /// fill brightness *is* the screen brightness at that point on the
+    /// timeline.
     ///
     /// # Safety
     /// Must be called inside a draw pass.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_rail(
         &self,
         t: &ID2D1HwndRenderTarget,
         p: &Palette,
         hair: &ID2D1SolidColorBrush,
         strong: &ID2D1SolidColorBrush,
-        dim_level: u8,
+        handle: &ID2D1SolidColorBrush,
+        label: &ID2D1SolidColorBrush,
+        e: Editable,
     ) {
+        let a = rail_axis();
+        let x_idle = a.pixel_of(e.idle_grace);
+        let x_dim = a.pixel_of(e.idle_grace + e.dim_after);
+        let x_away = a.pixel_of(e.idle_grace + e.away_after);
+        let x_deep = a.pixel_of(e.idle_grace + e.deep_after);
+
         // SAFETY: caller guarantees a live draw pass.
         unsafe {
             let outline = D2D1_ROUNDED_RECT {
@@ -984,17 +1243,42 @@ impl TuningWindow {
                 t.PushLayer(&params, &layer);
 
                 let seg = |x0: f32, x1: f32, c: Rgb| {
-                    if let Ok(b) = t.CreateSolidColorBrush(&colour(c), None) {
+                    if x1 > x0
+                        && let Ok(b) = t.CreateSolidColorBrush(&colour(c), None)
+                    {
                         t.FillRectangle(&rect(x0, 477.0, x1, 503.0), &b);
                     }
                 };
-                seg(MARGIN, 156.0, p.level_full);
-                seg(156.0, 178.0, crate::ui::theme::dim_fill(p, dim_level));
-                seg(178.0, CONTENT_R, p.level_black);
+                seg(MARGIN, x_dim, p.level_full);
+                seg(x_dim, x_away, crate::ui::theme::dim_fill(p, e.dim_level));
+                seg(x_away, CONTENT_R, p.level_black);
                 t.PopLayer();
             }
             t.DrawRoundedRectangle(&outline, hair, 1.0, None);
-            t.FillRectangle(&rect(316.0, 477.0, 317.0, 503.0), strong);
+
+            // The powered-down tail: an outline and a label rather than a
+            // colour, so "black" and "off" are told apart without chroma.
+            t.FillRectangle(&rect(x_deep, 477.0, x_deep + 1.0, 503.0), strong);
+
+            // The camera-opens dot sits on the track's top edge.
+            if let Ok(b) = t.CreateSolidColorBrush(&colour(p.good), None) {
+                let dot = D2D1_ROUNDED_RECT {
+                    rect: rect(x_idle - 3.0, 474.0, x_idle + 3.0, 480.0),
+                    radiusX: 3.0,
+                    radiusY: 3.0,
+                };
+                t.FillRoundedRectangle(&dot, &b);
+            }
+
+            for x in [x_idle, x_dim, x_away, x_deep] {
+                let h = D2D1_ROUNDED_RECT {
+                    rect: rect(x - 7.0, 462.0, x + 7.0, 476.0),
+                    radiusX: 7.0,
+                    radiusY: 7.0,
+                };
+                t.FillRoundedRectangle(&h, handle);
+            }
+            let _ = label;
         }
     }
 }
@@ -1142,6 +1426,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                             height: h,
                         });
                     }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                if let Some(this) = this {
+                    let x = (l.0 & 0xFFFF) as i16 as f32;
+                    let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32;
+                    this.drag_to(x, y);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                if let Some(this) = this {
+                    this.end_drag();
                 }
                 LRESULT(0)
             }
@@ -1376,6 +1674,157 @@ mod tests {
         assert!(w.frame.borrow().is_some());
         w.set_preview_state(false);
         assert!(w.frame.borrow().is_none(), "a stale frame is not a preview");
+    }
+
+    fn win() -> Box<TuningWindow> {
+        match TuningWindow::create(Theme::Dark) {
+            Some(w) => w,
+            None => panic!("could not create the tuning window"),
+        }
+    }
+
+    #[test]
+    fn the_threshold_follows_the_pointer_and_survives_release() {
+        let w = win();
+        let (gt, gb) = w.gauge_extent.get();
+        let axis = gauge_axis(gt, gb);
+        let start = w.edits.get().threshold;
+
+        // Grab it where it is drawn, then drag upward (a smaller pixel y).
+        let y = axis.pixel_of(start);
+        assert_eq!(w.hit_handle(370.0, y), Some(Grab::Threshold));
+        w.on_click(370.0, y);
+        w.drag_to(370.0, y - 40.0);
+
+        let moved = w.edits.get().threshold;
+        assert!(moved > start, "dragging up must raise the line: {moved}");
+        assert!(w.take_edits().is_none(), "not saved until released");
+        w.end_drag();
+        assert_eq!(w.take_edits().map(|e| e.threshold), Some(moved));
+        assert!(w.take_edits().is_none(), "draining consumes it");
+    }
+
+    #[test]
+    fn the_threshold_cannot_leave_the_scale() {
+        let w = win();
+        let (gt, gb) = w.gauge_extent.get();
+        w.on_click(370.0, gauge_axis(gt, gb).pixel_of(w.edits.get().threshold));
+        w.drag_to(370.0, gb + 500.0);
+        assert!(w.edits.get().threshold >= 0.02, "0.0 would match noise");
+        w.drag_to(370.0, gt - 500.0);
+        assert!(
+            w.edits.get().threshold <= GAUGE_TOP,
+            "off the top of the gauge"
+        );
+    }
+
+    #[test]
+    fn moving_the_camera_marker_slides_the_whole_sequence() {
+        // The three ladder values are stored RELATIVE to idle_grace, so this
+        // falls out of the representation. Asserting it pins the behaviour
+        // against someone later "fixing" them to be absolute.
+        let w = win();
+        let before = w.edits.get();
+        let a = rail_axis();
+
+        let x = a.pixel_of(before.idle_grace);
+        assert_eq!(w.hit_handle(x, 469.0), Some(Grab::IdleGrace));
+        w.on_click(x, 469.0);
+        w.drag_to(a.pixel_of(60.0), 469.0);
+        w.end_drag();
+
+        let after = w.edits.get();
+        assert!(after.idle_grace > before.idle_grace, "the camera moved");
+        assert_eq!(
+            after.dim_after, before.dim_after,
+            "relative values untouched"
+        );
+        assert_eq!(after.away_after, before.away_after);
+        assert_eq!(after.deep_after, before.deep_after);
+    }
+
+    #[test]
+    fn a_ladder_marker_stops_dead_against_its_neighbour() {
+        // Hard clamp, not cascade: dragging dim past black must not silently
+        // shove black further out. You went to change one number.
+        let w = win();
+        let before = w.edits.get();
+        let a = rail_axis();
+
+        let x = a.pixel_of(before.idle_grace + before.dim_after);
+        assert_eq!(w.hit_handle(x, 469.0), Some(Grab::DimAfter));
+        w.on_click(x, 469.0);
+        // Aim far past black.
+        w.drag_to(a.pixel_of(before.idle_grace + before.deep_after), 469.0);
+        w.end_drag();
+
+        let after = w.edits.get();
+        assert!(after.dim_after < after.away_after, "order must hold");
+        assert_eq!(
+            after.away_after, before.away_after,
+            "the neighbour must not have been pushed"
+        );
+    }
+
+    #[test]
+    fn a_status_push_does_not_yank_the_handle_out_of_your_hand() {
+        // The pump pushes status every 250ms. Mid-drag that would reseat the
+        // value from config and the handle would snap back under the mouse.
+        let w = win();
+        let (gt, gb) = w.gauge_extent.get();
+        let y = gauge_axis(gt, gb).pixel_of(w.edits.get().threshold);
+        w.on_click(370.0, y);
+        w.drag_to(370.0, y - 30.0);
+        let held = w.edits.get().threshold;
+
+        w.set_status(WindowStatus {
+            threshold: 0.42,
+            dim_level: 77,
+            ..WindowStatus::default()
+        });
+        assert_eq!(w.edits.get().threshold, held, "the drag wins");
+
+        // And after release, unsaved edits still win until they are drained.
+        w.end_drag();
+        w.set_status(WindowStatus {
+            threshold: 0.42,
+            monitor: "x".into(),
+            ..WindowStatus::default()
+        });
+        assert_eq!(w.edits.get().threshold, held, "unsaved edits are not stale");
+
+        // Once drained, a push seeds normally again.
+        let _ = w.take_edits();
+        w.set_status(WindowStatus {
+            threshold: 0.42,
+            monitor: "y".into(),
+            ..WindowStatus::default()
+        });
+        assert_eq!(w.edits.get().threshold, 0.42);
+    }
+
+    #[test]
+    fn the_dim_slider_snaps_to_fives() {
+        // Nobody wants to hunt for 37%.
+        let w = win();
+        w.on_click(dim_axis().pixel_of(20.0), 556.0);
+        w.drag_to(dim_axis().pixel_of(63.0), 556.0);
+        let v = w.edits.get().dim_level;
+        assert_eq!(v % 5, 0, "snapped to a five: {v}");
+        assert!((60..=65).contains(&v), "near where it was dragged: {v}");
+        w.end_drag();
+        assert_eq!(w.take_edits().map(|e| e.dim_level), Some(v));
+    }
+
+    #[test]
+    fn clicking_empty_space_grabs_nothing() {
+        let w = win();
+        assert_eq!(w.hit_handle(200.0, 420.0), None, "between sections");
+        assert_eq!(w.hit_handle(10.0, 690.0), None, "the footer");
+        w.on_click(200.0, 420.0);
+        w.drag_to(200.0, 300.0); // a drag with nothing held must do nothing
+        w.end_drag();
+        assert!(w.take_edits().is_none(), "nothing was edited");
     }
 
     #[test]
