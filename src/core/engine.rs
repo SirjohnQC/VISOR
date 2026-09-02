@@ -5,8 +5,9 @@ use crate::core::machine::Machine;
 use crate::core::types::{Command, DisplayLevel, Effect, FaceResult, State};
 use crate::sense::camera::Camera;
 use crate::sense::idle::IdleSource;
+use crate::sense::preview::PreviewFrame;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,23 @@ pub struct Engine {
     /// Kept alongside the machine so `check_camera` can judge against the same
     /// threshold the machine uses. Updated on reload.
     min_face_ratio: f32,
+    /// While set, the camera is held open for the tuning window and VISOR does
+    /// not act on what it sees. See `set_preview_hold`.
+    preview_hold: bool,
+    preview_tx: Option<Sender<PreviewFrame>>,
+}
+
+/// Whether a state legitimately has the camera open.
+///
+/// Used only to decide whether dropping a preview hold should shut the lens:
+/// closing one the machine still needs would strip it of its input, and
+/// leaving one open that it never wanted would quietly break the promise the
+/// camera LED makes.
+fn wants_camera(state: State) -> bool {
+    matches!(
+        state,
+        State::Watching | State::Dimmed | State::Away | State::Deep
+    )
 }
 
 impl Engine {
@@ -72,7 +90,46 @@ impl Engine {
             camera_open: false,
             cadence: Duration::from_secs(1),
             min_face_ratio: cfg.presence.min_face_ratio,
+            preview_hold: false,
+            preview_tx: None,
         }
+    }
+
+    /// Where preview frames go. The window lives on the pump thread, so this
+    /// is the same shape as `ChannelDisplay` in the other direction: plain
+    /// data crosses, the `!Send` camera stays here.
+    pub fn with_preview(mut self, tx: Sender<PreviewFrame>) -> Self {
+        self.preview_tx = Some(tx);
+        self
+    }
+
+    /// Hold the camera open for the tuning window, or let it go.
+    ///
+    /// Turning it on restores the display first. `min_face_ratio` cannot be
+    /// tuned on a screen VISOR is still holding dim, and the machine dims
+    /// precisely when nobody is at the keyboard -- which is not true of
+    /// someone dragging a slider, but the machine has no way to know that.
+    ///
+    /// While held, `tick` does not step the machine at all: VISOR watches
+    /// without acting. That is the honest reading of "the preview is open",
+    /// and it is what the scrim across the plate promises the user.
+    pub fn set_preview_hold(&mut self, on: bool) {
+        if self.preview_hold == on {
+            return;
+        }
+        self.preview_hold = on;
+        self.camera.set_preview(on);
+        if on {
+            self.display.apply(DisplayLevel::Full);
+            if !self.camera_open {
+                self.camera.open();
+                self.camera_open = true;
+            }
+        } else if self.camera_open && !wants_camera(self.machine.state()) {
+            self.camera.close();
+            self.camera_open = false;
+        }
+        tracing::info!(hold = on, "preview hold");
     }
 
     fn build_machine(cfg: &Config) -> Machine {
@@ -104,6 +161,18 @@ impl Engine {
     /// One iteration. Separated from `run` so tests can drive it with a
     /// simulated clock instead of sleeping.
     pub fn tick(&mut self, now: Instant) -> State {
+        if self.preview_hold {
+            // Watch without acting. No machine step, so no transitions and
+            // nothing touches the display.
+            let _ = self.camera.probe();
+            if let Some(frame) = self.camera.take_preview()
+                && let Some(tx) = self.preview_tx.as_ref()
+            {
+                // A closed receiver just means the window went away.
+                let _ = tx.send(frame);
+            }
+            return self.machine.state();
+        }
         let idle = self.idle.idle_for();
         let face = if self.camera_open {
             self.camera.probe()
@@ -215,6 +284,10 @@ impl Engine {
                 Ok(Command::Quit) => {
                     self.shutdown(state);
                     return;
+                }
+                Ok(Command::SetPreview(on)) => {
+                    self.set_preview_hold(on);
+                    status.store(self.state().as_u8(), Ordering::Relaxed);
                 }
                 Ok(Command::CheckCamera) => {
                     let verdict = self.check_camera();
@@ -340,6 +413,121 @@ mod tests {
 
         engine.check_camera();
         assert_eq!(closes.load(Ordering::Relaxed), 0, "must leave it open");
+    }
+
+    #[test]
+    fn preview_hold_opens_the_camera_and_ships_frames() {
+        // The window cannot show a preview from a shut camera, and the machine
+        // shuts it whenever the user is at the keyboard -- which is exactly
+        // when someone tuning a threshold is sitting there.
+        let cam = FakeCamera::new(vec![FaceResult::NoFace; 8]);
+        let opens = cam.open_count();
+        let frames = cam.frame_count();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(
+            Config::default(),
+            Arc::new(FakeIdle::new(Duration::ZERO)), // user is right here
+            Box::new(cam),
+            Box::new(SpyDisplay::new()),
+        )
+        .with_preview(tx);
+
+        engine.set_preview_hold(true);
+        assert_eq!(opens.load(Ordering::Relaxed), 1, "hold must open the lens");
+
+        engine.tick(Instant::now());
+        assert_eq!(frames.load(Ordering::Relaxed), 1);
+        let frame = rx.try_recv().expect("a frame should have been sent");
+        assert_eq!(frame.largest_ratio(), Some(0.5));
+    }
+
+    #[test]
+    fn visor_does_not_act_on_what_the_preview_sees() {
+        // Tuning must not dim the screen you are tuning on. With the hold on,
+        // an idle timer and a face-free camera would normally march down the
+        // ladder; here nothing may move at all.
+        let display = SpyDisplay::new();
+        let seen = display.log();
+        let mut engine = Engine::new(
+            Config::default(),
+            Arc::new(FakeIdle::new(Duration::from_secs(600))),
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 64])),
+            Box::new(display),
+        );
+        engine.set_preview_hold(true);
+        seen.lock().unwrap().clear();
+
+        let t0 = Instant::now();
+        for i in 0..40 {
+            engine.tick(t0 + Duration::from_secs(i * 30));
+        }
+        assert_eq!(engine.state(), State::Active, "no transitions while held");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may touch the display while the preview is up: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn turning_the_preview_on_puts_the_screen_back() {
+        // Opening the preview from a dimmed screen must undo the dim, or the
+        // user tunes against a display VISOR is still holding down.
+        let idle = Arc::new(FakeIdle::new(Duration::from_secs(30)));
+        let display = SpyDisplay::new();
+        let seen = display.log();
+        let mut engine = Engine::new(
+            Config::default(),
+            idle,
+            Box::new(FakeCamera::new(vec![FaceResult::NoFace; 64])),
+            Box::new(display),
+        );
+        let t0 = Instant::now();
+        engine.tick(t0);
+        engine.tick(t0 + Duration::from_secs(1));
+        engine.tick(t0 + Duration::from_secs(22));
+        assert_eq!(engine.state(), State::Dimmed);
+
+        engine.set_preview_hold(true);
+        assert_eq!(seen.lock().unwrap().last(), Some(&DisplayLevel::Full));
+    }
+
+    #[test]
+    fn dropping_the_hold_shuts_a_lens_the_machine_never_wanted_open() {
+        // Active never has the camera open. If the hold left it running the
+        // window would have quietly broken the promise the LED makes.
+        let cam = FakeCamera::new(vec![FaceResult::NoFace; 8]);
+        let closes = cam.close_count();
+        let mut engine = Engine::new(
+            Config::default(),
+            Arc::new(FakeIdle::new(Duration::ZERO)),
+            Box::new(cam),
+            Box::new(SpyDisplay::new()),
+        );
+        engine.set_preview_hold(true);
+        engine.set_preview_hold(false);
+        assert_eq!(closes.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.state(), State::Active);
+    }
+
+    #[test]
+    fn dropping_the_hold_leaves_a_lens_the_machine_still_needs() {
+        // Watching legitimately has the camera open; closing it here would
+        // strip the machine of its input for a tick.
+        let cam = FakeCamera::new(vec![FaceResult::NoFace; 16]);
+        let closes = cam.close_count();
+        let mut engine = Engine::new(
+            Config::default(),
+            Arc::new(FakeIdle::new(Duration::from_secs(30))),
+            Box::new(cam),
+            Box::new(SpyDisplay::new()),
+        );
+        engine.tick(Instant::now());
+        assert_eq!(engine.state(), State::Watching);
+
+        engine.set_preview_hold(true);
+        engine.set_preview_hold(false);
+        assert_eq!(closes.load(Ordering::Relaxed), 0, "must stay open");
     }
 
     #[test]

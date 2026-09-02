@@ -41,6 +41,11 @@ fn main() {
     let mut resolver = Resolver::new(&cfg.display);
     let (level_tx, level_rx) = mpsc::channel();
 
+    // Preview frames flow engine -> pump, the mirror of how display levels
+    // flow pump <- engine. Only plain data crosses; the !Send camera and the
+    // !Send window each stay on their own thread.
+    let (preview_tx, preview_rx) = mpsc::channel();
+
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(AtomicU8::new(0));
     // Only the engine owns the camera, so only it can answer "can you see me?".
@@ -60,7 +65,7 @@ fn main() {
         move || {
             let camera = Box::new(WinRtCamera::new(""));
             let display = Box::new(ChannelDisplay { tx: level_tx });
-            let engine = Engine::new(cfg, idle, camera, display);
+            let engine = Engine::new(cfg, idle, camera, display).with_preview(preview_tx);
             engine.run(rx, status, check_engine)
         }
     });
@@ -75,7 +80,15 @@ fn main() {
     // thing that could be observed in a torn state is `resolver`, and the very
     // next thing we do is force it to a known one.
     let pump = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Err(e) = visor::ui::tray::run(tx, status, level_rx, &mut resolver, check, theme) {
+        if let Err(e) = visor::ui::tray::run(
+            tx,
+            status,
+            level_rx,
+            &mut resolver,
+            check,
+            theme,
+            preview_rx,
+        ) {
             tracing::error!(error = %e, "tray failed");
         }
     }));

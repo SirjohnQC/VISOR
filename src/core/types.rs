@@ -51,5 +51,12 @@ pub enum Command {
     /// user. Every way this can fail is otherwise silent — a covered lens, a
     /// bad angle, or a face below `min_face_ratio` all just look like absence.
     CheckCamera,
+    /// Hold the camera open and stream preview frames for the tuning window,
+    /// or stop doing so.
+    ///
+    /// This is not a state-machine command -- `Machine::command` ignores it.
+    /// The engine handles it alone, because what it changes is what the engine
+    /// does with the camera, not what the machine believes about presence.
+    SetPreview(bool),
     Quit,
 }

@@ -16,15 +16,19 @@
 //! is a fraction of the code and correct for a window this size. Swapping it
 //! later touches only `Renderer::create`.
 
+use crate::sense::preview::PreviewFrame;
 use crate::ui::theme::{Palette, Rgb, Theme, palette};
+use std::cell::Cell;
 use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget,
-    ID2D1SolidColorBrush,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_ROUNDED_RECT, D2D1CreateFactory,
+    ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -36,8 +40,8 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HMENU,
     IDC_ARROW, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW, SetWindowLongPtrW, ShowWindow,
-    WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_CAPTION,
+    WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 use windows::core::PCWSTR;
 
@@ -49,6 +53,17 @@ const MARGIN: f32 = 22.0;
 const CONTENT_R: f32 = WIN_W - MARGIN;
 
 const CLASS_NAME: &str = "VISOR.TuningWindow";
+
+/// The preview plate.
+const PLATE: (f32, f32, f32, f32) = (MARGIN, 108.0, 342.0, 348.0);
+/// The in-plate preview toggle. One rect, used by BOTH the painter and the
+/// hit test -- two copies of these numbers is how a button ends up drawn in
+/// one place and clickable in another.
+const PREVIEW_BTN: (f32, f32, f32, f32) = (119.0, 280.0, 245.0, 312.0);
+
+fn hit(r: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+    x >= r.0 && x < r.2 && y >= r.1 && y < r.3
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -166,6 +181,17 @@ pub struct TuningWindow {
     renderer: RefCell<Option<Renderer>>,
     palette: RefCell<Palette>,
     visible: RefCell<bool>,
+    /// The most recent preview frame, and the D2D bitmap it was uploaded into.
+    frame: RefCell<Option<PreviewFrame>>,
+    bitmap: RefCell<Option<(ID2D1Bitmap, u32, u32)>>,
+    /// Scratch BGRA buffer, reused so a 15fps preview does not allocate
+    /// 1.2 MB per frame.
+    bgra: RefCell<Vec<u8>>,
+    preview_on: Cell<bool>,
+    /// Set by a click, drained by the pump. The window cannot talk to the
+    /// engine itself -- it does not own the command channel -- so it leaves a
+    /// note and `ui::tray` posts it.
+    pending_preview: Cell<Option<bool>>,
 }
 
 impl TuningWindow {
@@ -198,6 +224,11 @@ impl TuningWindow {
             renderer: RefCell::new(None),
             palette: RefCell::new(palette(theme)),
             visible: RefCell::new(false),
+            frame: RefCell::new(None),
+            bitmap: RefCell::new(None),
+            bgra: RefCell::new(Vec::new()),
+            preview_on: Cell::new(false),
+            pending_preview: Cell::new(None),
         });
 
         let class = wide(CLASS_NAME);
@@ -239,6 +270,30 @@ impl TuningWindow {
         *self.visible.borrow()
     }
 
+    /// A preview frame from the engine.
+    pub fn set_frame(&self, frame: PreviewFrame) {
+        *self.frame.borrow_mut() = Some(frame);
+        if self.is_visible() {
+            self.invalidate();
+        }
+    }
+
+    /// A click asked to turn the preview on or off; `None` if nothing is
+    /// waiting. Drained by the pump, which owns the command channel.
+    pub fn take_preview_request(&self) -> Option<bool> {
+        self.pending_preview.take()
+    }
+
+    /// Told by the pump what actually happened, so the button label and the
+    /// engine can never disagree.
+    pub fn set_preview_state(&self, on: bool) {
+        self.preview_on.set(on);
+        if !on {
+            *self.frame.borrow_mut() = None;
+        }
+        self.invalidate();
+    }
+
     pub fn show(&self) {
         *self.visible.borrow_mut() = true;
         // SAFETY: `self.hwnd` is live for as long as this struct is.
@@ -250,6 +305,12 @@ impl TuningWindow {
 
     pub fn hide(&self) {
         *self.visible.borrow_mut() = false;
+        // Never leave the camera held open behind an invisible window. The
+        // request goes through the pump like any other, so the engine and the
+        // LED agree with what the user can see.
+        if self.preview_on.get() {
+            self.pending_preview.set(Some(false));
+        }
         // SAFETY: as above.
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -262,6 +323,68 @@ impl TuningWindow {
         } else {
             self.show()
         }
+    }
+
+    /// Route a click. The only live control so far is the preview toggle;
+    /// the markers land next and will hang off the same test.
+    fn on_click(&self, x: f32, y: f32) {
+        if hit(PREVIEW_BTN, x, y) {
+            self.pending_preview.set(Some(!self.preview_on.get()));
+        }
+    }
+
+    /// Upload the newest luminance frame into a reusable D2D bitmap.
+    ///
+    /// The frame is one byte per pixel and D2D wants four, so it is expanded
+    /// into a scratch buffer kept between frames. At 15fps a fresh 1.2 MB
+    /// allocation per frame would be the most expensive thing in an otherwise
+    /// 1 Hz program.
+    fn upload(&self, t: &ID2D1HwndRenderTarget, f: &PreviewFrame) -> Option<ID2D1Bitmap> {
+        let (w, h) = (f.width, f.height);
+        if f.luma.len() < (w * h) as usize {
+            return None;
+        }
+        let mut bgra = self.bgra.borrow_mut();
+        bgra.resize((w * h * 4) as usize, 0);
+        for (i, &l) in f.luma.iter().enumerate().take((w * h) as usize) {
+            let o = i * 4;
+            bgra[o] = l;
+            bgra[o + 1] = l;
+            bgra[o + 2] = l;
+            bgra[o + 3] = 0xFF;
+        }
+
+        let mut slot = self.bitmap.borrow_mut();
+        let same = matches!(slot.as_ref(), Some((_, bw, bh)) if *bw == w && *bh == h);
+        if !same {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            // SAFETY: `bgra` holds exactly w*h*4 bytes and outlives the call.
+            let made = unsafe {
+                t.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: w,
+                        height: h,
+                    },
+                    Some(bgra.as_ptr() as *const core::ffi::c_void),
+                    w * 4,
+                    &props,
+                )
+            };
+            *slot = made.ok().map(|b| (b, w, h));
+        } else if let Some((b, _, _)) = slot.as_ref() {
+            // SAFETY: the bitmap is w*h and `bgra` holds exactly that many pixels.
+            unsafe {
+                let _ = b.CopyFromMemory(None, bgra.as_ptr() as *const core::ffi::c_void, w * 4);
+            }
+        }
+        slot.as_ref().map(|(b, _, _)| b.clone())
     }
 
     fn invalidate(&self) {
@@ -375,7 +498,7 @@ impl TuningWindow {
 
             // ---- preview plate --------------------------------------------
             let plate = D2D1_ROUNDED_RECT {
-                rect: rect(MARGIN, 108.0, 342.0, 348.0),
+                rect: rect(PLATE.0, PLATE.1, PLATE.2, PLATE.3),
                 radiusX: 10.0,
                 radiusY: 10.0,
             };
@@ -384,11 +507,111 @@ impl TuningWindow {
             }
             t.DrawRoundedRectangle(&plate, &b_hair, 1.0, None);
             align(&r.fonts.body, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+            let frame = self.frame.borrow();
+            if let Some(f) = frame.as_ref().filter(|f| f.width > 0 && f.height > 0) {
+                // Letterbox, never crop. `largest_ratio` is FaceBox.Height over
+                // the FRAME height, so cropping to fill would change the
+                // effective height and the ratio drawn would stop matching the
+                // ratio measured -- the one thing this window must not do.
+                let (pw, ph) = (PLATE.2 - PLATE.0, PLATE.3 - PLATE.1);
+                let scale = (pw / f.width as f32).min(ph / f.height as f32);
+                let (dw, dh) = (f.width as f32 * scale, f.height as f32 * scale);
+                let (dx, dy) = (PLATE.0 + (pw - dw) / 2.0, PLATE.1 + (ph - dh) / 2.0);
+
+                if let Some(bmp) = self.upload(t, f) {
+                    t.DrawBitmap(
+                        &bmp,
+                        Some(&rect(dx, dy, dx + dw, dy + dh)),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+
+                // Corner brackets, not a rectangle: brackets read as a
+                // viewfinder, a closed box reads as surveillance.
+                if let Some(b_good) = brush(p.good) {
+                    for fb in &f.faces {
+                        let (bx, by) = (dx + fb.x as f32 * scale, dy + fb.y as f32 * scale);
+                        let (bw2, bh2) = (fb.w as f32 * scale, fb.h as f32 * scale);
+                        let arm = (bh2 / 4.0).clamp(4.0, 18.0);
+                        for (cx, cy, sx, sy) in [
+                            (bx, by, 1.0f32, 1.0f32),
+                            (bx + bw2, by, -1.0, 1.0),
+                            (bx, by + bh2, 1.0, -1.0),
+                            (bx + bw2, by + bh2, -1.0, -1.0),
+                        ] {
+                            t.DrawLine(
+                                D2D_POINT_2F { x: cx, y: cy },
+                                D2D_POINT_2F {
+                                    x: cx + arm * sx,
+                                    y: cy,
+                                },
+                                &b_good,
+                                2.0,
+                                None,
+                            );
+                            t.DrawLine(
+                                D2D_POINT_2F { x: cx, y: cy },
+                                D2D_POINT_2F {
+                                    x: cx,
+                                    y: cy + arm * sy,
+                                },
+                                &b_good,
+                                2.0,
+                                None,
+                            );
+                        }
+                    }
+                }
+
+                // The scrim carrying the promise that none of this is acted on.
+                if let Some(b_scrim) = brush(Rgb(0, 0, 0)) {
+                    t.FillRectangle(&rect(PLATE.0 + 1.0, 322.0, PLATE.2 - 1.0, 347.0), &b_scrim);
+                }
+                text(
+                    "Tuning — VISOR will not dim while the preview is on.",
+                    &r.fonts.micro,
+                    rect(PLATE.0 + 10.0, 328.0, PLATE.2, 344.0),
+                    &b_t2,
+                );
+            } else {
+                text(
+                    "Camera is closed",
+                    &r.fonts.body,
+                    rect(PLATE.0 + 100.0, 196.0, PLATE.2, 220.0),
+                    &b_t2,
+                );
+                text(
+                    "VISOR opens it only after 30 s without keyboard or mouse. Nothing it sees ever leaves this PC.",
+                    &r.fonts.caption,
+                    rect(PLATE.0 + 50.0, 222.0, PLATE.2 - 50.0, 274.0),
+                    &b_t3,
+                );
+            }
+
+            // The preview toggle, drawn from the same rect the hit test uses.
+            let btn = D2D1_ROUNDED_RECT {
+                rect: rect(PREVIEW_BTN.0, PREVIEW_BTN.1, PREVIEW_BTN.2, PREVIEW_BTN.3),
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            t.DrawRoundedRectangle(&btn, &b_strong, 1.0, None);
             text(
-                "Camera is closed",
+                if self.preview_on.get() {
+                    "Turn off preview"
+                } else {
+                    "Turn on preview"
+                },
                 &r.fonts.body,
-                rect(MARGIN + 90.0, 200.0, 342.0, 226.0),
-                &b_t2,
+                rect(
+                    PREVIEW_BTN.0 + 14.0,
+                    PREVIEW_BTN.1 + 5.0,
+                    PREVIEW_BTN.2,
+                    PREVIEW_BTN.3,
+                ),
+                &b_t1,
             );
 
             // ---- gauge column ---------------------------------------------
@@ -593,6 +816,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             // Closing hides to the tray; VISOR keeps running. Quitting is a
             // separate, deliberate act from the tray menu or the footer.
+            WM_LBUTTONDOWN => {
+                if let Some(this) = this {
+                    let x = (l.0 & 0xFFFF) as i16 as f32;
+                    let y = ((l.0 >> 16) & 0xFFFF) as i16 as f32;
+                    this.on_click(x, y);
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 if let Some(this) = this {
                     this.hide();
@@ -645,6 +876,153 @@ mod tests {
             }
         }
         w.hide();
+    }
+
+    fn frame(w: u32, h: u32, face_h: u32) -> PreviewFrame {
+        PreviewFrame {
+            width: w,
+            height: h,
+            luma: (0..(w * h)).map(|i| (i % 255) as u8).collect(),
+            faces: vec![crate::sense::preview::FaceBox {
+                x: w / 4,
+                y: h / 4,
+                w: face_h / 2,
+                h: face_h,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_button_is_clickable_where_it_is_drawn() {
+        // One rect feeds both the painter and the hit test. Two copies of
+        // these numbers is exactly how a button ends up drawn in one place
+        // and clickable in another.
+        let (l, t, r, b) = PREVIEW_BTN;
+        assert!(hit(PREVIEW_BTN, (l + r) / 2.0, (t + b) / 2.0), "centre");
+        assert!(hit(PREVIEW_BTN, l, t), "top-left corner is inside");
+        assert!(!hit(PREVIEW_BTN, r, b), "bottom-right is exclusive");
+        assert!(!hit(PREVIEW_BTN, l - 1.0, (t + b) / 2.0));
+        // And it sits within the plate it is drawn on.
+        assert!(l >= PLATE.0 && r <= PLATE.2 && t >= PLATE.1 && b <= PLATE.3);
+    }
+
+    #[test]
+    fn clicking_the_button_asks_the_engine_rather_than_acting() {
+        // The window does not own the camera or the command channel. It
+        // leaves a note; the pump posts it. That is what keeps the label, the
+        // engine and the camera LED from ever disagreeing.
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        assert_eq!(w.take_preview_request(), None, "nothing pending at rest");
+
+        let (l, t, r, b) = PREVIEW_BTN;
+        w.on_click((l + r) / 2.0, (t + b) / 2.0);
+        assert_eq!(w.take_preview_request(), Some(true));
+        assert_eq!(w.take_preview_request(), None, "draining consumes it");
+
+        // Nothing changed until the pump says so.
+        w.set_preview_state(true);
+        w.on_click((l + r) / 2.0, (t + b) / 2.0);
+        assert_eq!(w.take_preview_request(), Some(false), "it toggles");
+    }
+
+    #[test]
+    fn a_click_outside_the_button_does_nothing() {
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        w.on_click(5.0, 5.0);
+        w.on_click(WIN_W - 5.0, WIN_H - 5.0);
+        assert_eq!(w.take_preview_request(), None);
+    }
+
+    #[test]
+    fn hiding_the_window_gives_the_camera_back() {
+        // The one rule that must not have an exception: no path may leave the
+        // lens held open behind a window nobody can see.
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        w.set_preview_state(true);
+        let _ = w.take_preview_request();
+        w.hide();
+        assert_eq!(
+            w.take_preview_request(),
+            Some(false),
+            "hiding must release the camera"
+        );
+    }
+
+    #[test]
+    fn hiding_a_window_that_never_held_the_camera_asks_for_nothing() {
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        w.hide();
+        assert_eq!(w.take_preview_request(), None);
+    }
+
+    #[test]
+    fn a_frame_is_drawn_letterboxed_without_crashing() {
+        // Exercises the whole upload path -- luminance expanded to BGRA, the
+        // bitmap created then reused, the brackets scaled onto it -- at two
+        // aspect ratios, because the letterbox arithmetic is where cropping
+        // would silently creep back in.
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        w.set_preview_state(true);
+        w.set_frame(frame(640, 480, 120)); // 4:3, fills the plate
+        w.paint();
+        assert!(w.bitmap.borrow().is_some(), "a bitmap should be cached");
+
+        w.set_frame(frame(640, 360, 90)); // 16:9, letterboxed
+        w.paint();
+        let cached = w.bitmap.borrow().as_ref().map(|(_, bw, bh)| (*bw, *bh));
+        assert_eq!(
+            cached,
+            Some((640, 360)),
+            "the bitmap follows the frame size"
+        );
+
+        // Same size again must reuse rather than recreate.
+        w.set_frame(frame(640, 360, 60));
+        w.paint();
+        assert_eq!(
+            w.bitmap.borrow().as_ref().map(|(_, bw, bh)| (*bw, *bh)),
+            Some((640, 360))
+        );
+    }
+
+    #[test]
+    fn a_malformed_frame_is_refused_rather_than_read_past() {
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        w.set_preview_state(true);
+        w.set_frame(PreviewFrame {
+            width: 64,
+            height: 64,
+            luma: vec![7; 10], // far too short for what it claims
+            faces: Vec::new(),
+        });
+        w.paint(); // must not panic or read out of bounds
+        assert!(w.bitmap.borrow().is_none(), "nothing should be uploaded");
+    }
+
+    #[test]
+    fn turning_the_preview_off_drops_the_last_frame() {
+        // Otherwise the plate keeps showing a picture of the user beside a
+        // chip that says the camera is off.
+        let Some(w) = TuningWindow::create(Theme::Dark) else {
+            panic!("could not create the tuning window");
+        };
+        w.set_preview_state(true);
+        w.set_frame(frame(64, 48, 12));
+        assert!(w.frame.borrow().is_some());
+        w.set_preview_state(false);
+        assert!(w.frame.borrow().is_none(), "a stale frame is not a preview");
     }
 
     #[test]

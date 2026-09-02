@@ -97,6 +97,7 @@ pub fn run(
     resolver: &mut Resolver,
     check: CheckSlot,
     theme: Theme,
+    preview: Receiver<crate::sense::preview::PreviewFrame>,
 ) -> Result<()> {
     let win = |e: tray_icon::BadIcon| VisorError::Windows(e.to_string());
     // Slate for normal operation, amber for the Degraded warning.
@@ -227,6 +228,29 @@ pub fn run(
         if drain_levels(&levels, |level| resolver.apply(level)) == Drain::EngineGone {
             tracing::error!("engine thread is gone; restoring the display and exiting");
             return Ok(());
+        }
+
+        // Newest preview frame wins: at 15fps several can queue while a DDC
+        // write blocks the pump, and drawing the stale ones would just add
+        // latency to a picture of the user moving.
+        let mut newest = None;
+        while let Ok(f) = preview.try_recv() {
+            newest = Some(f);
+        }
+        if let (Some(f), Some(w)) = (newest, tuning_window.as_ref()) {
+            w.set_frame(f);
+        }
+
+        // The window cannot reach the engine itself, so it leaves a note and
+        // this loop posts it. Going through the command channel is what keeps
+        // the button label, the engine and the camera LED in agreement.
+        if let Some(w) = tuning_window.as_ref()
+            && let Some(on) = w.take_preview_request()
+        {
+            if tx.send(Command::SetPreview(on)).is_err() {
+                return Ok(());
+            }
+            w.set_preview_state(on);
         }
 
         // A camera-check result outranks the state tooltip for a few seconds:

@@ -330,6 +330,8 @@ pub struct FakeCamera {
     script: Mutex<std::vec::IntoIter<FaceResult>>,
     opens: Arc<AtomicUsize>,
     closes: Arc<AtomicUsize>,
+    preview: bool,
+    frames: Arc<AtomicUsize>,
 }
 
 impl FakeCamera {
@@ -338,7 +340,13 @@ impl FakeCamera {
             script: Mutex::new(script.into_iter()),
             opens: Arc::new(AtomicUsize::new(0)),
             closes: Arc::new(AtomicUsize::new(0)),
+            preview: false,
+            frames: Arc::new(AtomicUsize::new(0)),
         }
+    }
+    /// How many preview frames have been handed out.
+    pub fn frame_count(&self) -> Arc<AtomicUsize> {
+        self.frames.clone()
     }
     pub fn open_count(&self) -> Arc<AtomicUsize> {
         self.opens.clone()
@@ -361,6 +369,28 @@ impl Camera for FakeCamera {
             .unwrap()
             .next()
             .unwrap_or(FaceResult::NoFace)
+    }
+    fn set_preview(&mut self, on: bool) {
+        self.preview = on;
+    }
+    fn take_preview(&mut self) -> Option<PreviewFrame> {
+        if !self.preview {
+            return None;
+        }
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        // A 4x4 mid-grey frame with one face box half the frame high, so a
+        // consumer can assert a ratio of 0.5 without a webcam.
+        Some(PreviewFrame {
+            width: 4,
+            height: 4,
+            luma: vec![128; 16],
+            faces: vec![FaceBox {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            }],
+        })
     }
 }
 
