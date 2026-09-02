@@ -1,3 +1,13 @@
+// No console window. VISOR is a background application with a tray icon; a
+// flashing terminal on launch is noise, and it is what you get by default
+// because Cargo builds a console subsystem binary.
+//
+// The cost is that stdout and stderr go nowhere. Everything after logging is
+// initialised writes to the log file, so that is fine -- but the one failure
+// that happens BEFORE the logger exists would become completely silent, which
+// is why `fatal` below exists.
+#![windows_subsystem = "windows"]
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::mpsc;
@@ -10,6 +20,28 @@ use visor::core::types::DisplayLevel;
 use visor::sense::camera::WinRtCamera;
 use visor::sense::idle::Win32Idle;
 
+/// Report a startup failure that happens before there is anywhere to log it.
+///
+/// Deliberately the only message box in VISOR. The program is meant to be
+/// ambient and silent; interrupting the user is reserved for "it did not
+/// start at all", which they would otherwise discover by noticing an absence.
+fn fatal(message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    use windows::core::PCWSTR;
+    let text: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "VISOR".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both buffers are null-terminated and outlive the call, which
+    // only reads them.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
 fn main() {
     let path = Config::default_path();
     Config::write_defaults_if_missing(&path);
@@ -20,7 +52,15 @@ fn main() {
     let _guard = match visor::logging::init(&bootstrap.log.level) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("visor: could not initialise logging: {e}");
+            // The only path in the program with nowhere to log to, because
+            // this IS the logger failing. Without a console to print to, a
+            // message box is the only way this does not vanish -- and it
+            // vanishing would mean VISOR silently not starting, with no icon,
+            // no log, and no clue why.
+            fatal(&format!(
+                "VISOR could not start.\n\nLogging could not be initialised: {e}\n\n\
+                 Check that %APPDATA%\\VISOR is writable."
+            ));
             return;
         }
     };

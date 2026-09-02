@@ -206,6 +206,22 @@ impl Resolver {
         self.attached
     }
 
+    /// What the tuning window's DISPLAY section reports: the first driven
+    /// monitor, whether it speaks DDC/CI, and whether brightness writes are
+    /// actually confirmed on it.
+    ///
+    /// Read from the live resolver rather than re-probed, so the window can
+    /// never disagree with the mechanism actually in use.
+    pub fn primary(&self) -> Option<(String, bool, bool)> {
+        self.targets.first().map(|t| {
+            (
+                t.description.clone(),
+                t.ddc.is_some(),
+                t.cap.brightness_confirmed,
+            )
+        })
+    }
+
     /// Spec §6.2 — restore in a fixed order rather than by picking a mechanism.
     fn restore(&mut self) {
         // 1. Drop the overlay first; it is the fastest thing to undo.

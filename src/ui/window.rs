@@ -16,11 +16,16 @@
 //! is a fraction of the code and correct for a window this size. Swapping it
 //! later touches only `Renderer::create`.
 
+use crate::core::types::State;
 use crate::sense::preview::PreviewFrame;
+use crate::ui::signal::{
+    CameraStatus, Confirmation, Envelope, SMOOTH_ALPHA, SignalState, classify, quantise, smooth,
+    suggested,
+};
 use crate::ui::theme::{Palette, Rgb, Theme, palette};
 use std::cell::Cell;
 use std::cell::RefCell;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -38,10 +43,10 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HMENU,
-    IDC_ARROW, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW, SetWindowLongPtrW, ShowWindow,
-    WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_NCCREATE, WM_PAINT, WNDCLASSW, WS_CAPTION,
-    WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
+    GetWindowLongPtrW, HMENU, IDC_ARROW, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW,
+    SetWindowLongPtrW, ShowWindow, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_NCCREATE, WM_PAINT,
+    WM_SIZE, WNDCLASSW, WS_CAPTION, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
 };
 use windows::core::PCWSTR;
 
@@ -56,10 +61,44 @@ const CLASS_NAME: &str = "VISOR.TuningWindow";
 
 /// The preview plate.
 const PLATE: (f32, f32, f32, f32) = (MARGIN, 108.0, 342.0, 348.0);
-/// The in-plate preview toggle. One rect, used by BOTH the painter and the
-/// hit test -- two copies of these numbers is how a button ends up drawn in
-/// one place and clickable in another.
-const PREVIEW_BTN: (f32, f32, f32, f32) = (119.0, 280.0, 245.0, 312.0);
+/// The preview toggle, in its two positions. One rect each, used by BOTH the
+/// painter and the hit test -- two copies of these numbers is how a button
+/// ends up drawn in one place and clickable in another.
+///
+/// With the camera shut the button is the call to action, so it sits in the
+/// middle of an empty plate. Once video is running the middle of the plate is
+/// the user's face, so it moves to the top corner where the picture is almost
+/// always ceiling or wall.
+const PREVIEW_BTN_IDLE: (f32, f32, f32, f32) = (120.0, 268.0, 244.0, 300.0);
+const PREVIEW_BTN_LIVE: (f32, f32, f32, f32) = (240.0, 116.0, 336.0, 140.0);
+
+/// What the window is told about the rest of VISOR each tick.
+///
+/// The window derives nothing it can be handed: the threshold and the state
+/// come from the same config and machine everything else uses, so the number
+/// on screen cannot drift from the number being acted on.
+#[derive(Debug, Clone)]
+pub struct WindowStatus {
+    pub state: State,
+    pub threshold: f32,
+    pub dim_level: u8,
+    pub monitor: String,
+    pub ddc: bool,
+    pub brightness_confirmed: bool,
+}
+
+impl Default for WindowStatus {
+    fn default() -> Self {
+        Self {
+            state: State::Active,
+            threshold: 0.15,
+            dim_level: 20,
+            monitor: String::new(),
+            ddc: false,
+            brightness_confirmed: false,
+        }
+    }
+}
 
 fn hit(r: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
     x >= r.0 && x < r.2 && y >= r.1 && y < r.3
@@ -83,7 +122,12 @@ fn rect(l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
     }
 }
 
-/// The eight cached text formats, one per level of the type scale.
+/// The cached text formats, one per level of the type scale.
+///
+/// No wordmark level: the native title bar already says VISOR, and a second
+/// wordmark drawn under it was brand noise occupying the one row that had a
+/// genuine use -- the camera status, which has to be visible at a glance and
+/// has to agree with the hardware LED.
 struct Fonts {
     numeral: IDWriteTextFormat,
     title: IDWriteTextFormat,
@@ -92,7 +136,6 @@ struct Fonts {
     caption: IDWriteTextFormat,
     micro: IDWriteTextFormat,
     section: IDWriteTextFormat,
-    wordmark: IDWriteTextFormat,
 }
 
 impl Fonts {
@@ -134,7 +177,6 @@ impl Fonts {
             caption: make(12.0, 400)?,
             micro: make(10.5, 400)?,
             section: make(11.0, 600)?,
-            wordmark: make(13.0, 700)?,
         })
     }
 }
@@ -188,6 +230,14 @@ pub struct TuningWindow {
     /// 1.2 MB per frame.
     bgra: RefCell<Vec<u8>>,
     preview_on: Cell<bool>,
+    status: RefCell<WindowStatus>,
+    /// The rolling min/max the verdict is judged on. Lives here rather than in
+    /// the engine because it is a property of what the user is being shown,
+    /// not of what VISOR is deciding.
+    envelope: RefCell<Envelope>,
+    confirmation: RefCell<Confirmation>,
+    smoothed: Cell<Option<f32>>,
+    shown: Cell<Option<f32>>,
     /// Set by a click, drained by the pump. The window cannot talk to the
     /// engine itself -- it does not own the command channel -- so it leaves a
     /// note and `ui::tray` posts it.
@@ -228,11 +278,33 @@ impl TuningWindow {
             bitmap: RefCell::new(None),
             bgra: RefCell::new(Vec::new()),
             preview_on: Cell::new(false),
+            status: RefCell::new(WindowStatus::default()),
+            envelope: RefCell::new(Envelope::new()),
+            confirmation: RefCell::new(Confirmation::new()),
+            smoothed: Cell::new(None),
+            shown: Cell::new(None),
             pending_preview: Cell::new(None),
         });
 
         let class = wide(CLASS_NAME);
         let title = wide("VISOR");
+
+        // CreateWindowExW takes the OUTER size, but every coordinate in the
+        // design is a client coordinate. Passing 420x696 straight in gives a
+        // client area smaller by the caption and borders -- roughly 32px of
+        // the bottom, which is the whole footer -- and silently squeezes the
+        // layout. Ask Windows how big the frame needs to be instead.
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: WIN_W as i32,
+            bottom: WIN_H as i32,
+        };
+        // SAFETY: `outer` is a local RECT the call only writes into.
+        unsafe {
+            let _ = AdjustWindowRectEx(&mut outer, style, false, WS_EX_APPWINDOW);
+        }
         // The box is passed as the creation param so the WndProc can find it
         // from the very first message; see `wndproc`'s WM_NCCREATE arm.
         let ptr: *mut TuningWindow = &mut *me;
@@ -246,11 +318,11 @@ impl TuningWindow {
                 PCWSTR(title.as_ptr()),
                 // No WS_THICKFRAME and no WS_MAXIMIZEBOX: the layout is a
                 // table of constants, so the window does not resize.
-                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                style,
                 windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
                 windows::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
-                WIN_W as i32,
-                WIN_H as i32,
+                outer.right - outer.left,
+                outer.bottom - outer.top,
                 None,
                 HMENU(std::ptr::null_mut()),
                 None,
@@ -271,11 +343,64 @@ impl TuningWindow {
     }
 
     /// A preview frame from the engine.
+    ///
+    /// This is also where the measurement is taken: the envelope gets the RAW
+    /// ratio (its job is to catch the dips smoothing would hide) while the
+    /// number on screen gets the smoothed, dead-banded one.
     pub fn set_frame(&self, frame: PreviewFrame) {
+        let now = std::time::Instant::now();
+        match frame.largest_ratio() {
+            Some(r) => {
+                self.envelope.borrow_mut().push(now, r);
+                let sm = smooth(self.smoothed.get(), r, SMOOTH_ALPHA);
+                self.smoothed.set(Some(sm));
+                self.shown.set(Some(quantise(self.shown.get(), sm)));
+            }
+            None => {
+                // No face is not a reading of zero -- recording one would drag
+                // the envelope minimum to the floor and make every threshold
+                // look unsafe. Just let the window age out.
+                self.envelope.borrow_mut().expire(now);
+                self.smoothed.set(None);
+                self.shown.set(None);
+            }
+        }
         *self.frame.borrow_mut() = Some(frame);
         if self.is_visible() {
             self.invalidate();
         }
+    }
+
+    /// State, threshold and display diagnostics, pushed by the pump each tick.
+    pub fn set_status(&self, status: WindowStatus) {
+        let changed = {
+            let cur = self.status.borrow();
+            (cur.threshold - status.threshold).abs() > f32::EPSILON
+                || cur.state != status.state
+                || cur.ddc != status.ddc
+                || cur.monitor != status.monitor
+                || cur.dim_level != status.dim_level
+        };
+        if changed {
+            *self.status.borrow_mut() = status;
+            if self.is_visible() {
+                self.invalidate();
+            }
+        }
+    }
+
+    /// The measurement, as the window will draw it.
+    fn signal(&self) -> (SignalState, Option<f32>, Option<f32>) {
+        let threshold = self.status.borrow().threshold;
+        let cam = if !self.preview_on.get() {
+            CameraStatus::Closed
+        } else if self.frame.borrow().is_some() {
+            CameraStatus::Live
+        } else {
+            CameraStatus::Unavailable
+        };
+        let low = self.envelope.borrow().min();
+        (classify(cam, low, threshold), self.shown.get(), low)
     }
 
     /// A click asked to turn the preview on or off; `None` if nothing is
@@ -290,6 +415,16 @@ impl TuningWindow {
         self.preview_on.set(on);
         if !on {
             *self.frame.borrow_mut() = None;
+            self.envelope.borrow_mut().clear();
+            self.smoothed.set(None);
+            self.shown.set(None);
+            self.confirmation.borrow_mut().cancel();
+        } else {
+            // A fresh look starts a fresh confirmation.
+            self.envelope.borrow_mut().clear();
+            self.confirmation
+                .borrow_mut()
+                .restart(std::time::Instant::now());
         }
         self.invalidate();
     }
@@ -327,8 +462,16 @@ impl TuningWindow {
 
     /// Route a click. The only live control so far is the preview toggle;
     /// the markers land next and will hang off the same test.
+    fn preview_btn(&self) -> (f32, f32, f32, f32) {
+        if self.preview_on.get() {
+            PREVIEW_BTN_LIVE
+        } else {
+            PREVIEW_BTN_IDLE
+        }
+    }
+
     fn on_click(&self, x: f32, y: f32) {
-        if hit(PREVIEW_BTN, x, y) {
+        if hit(self.preview_btn(), x, y) {
             self.pending_preview.set(Some(!self.preview_on.get()));
         }
     }
@@ -434,6 +577,9 @@ impl TuningWindow {
     /// Must be called between `BeginDraw` and `EndDraw` on `r.target`.
     unsafe fn draw_chrome(&self, r: &Renderer, p: &Palette) {
         let t = &r.target;
+        let st = self.status.borrow().clone();
+        let (signal, shown, low) = self.signal();
+
         // SAFETY: the caller guarantees we are inside a draw pass.
         unsafe {
             let brush = |c: Rgb| -> Option<ID2D1SolidColorBrush> {
@@ -449,11 +595,22 @@ impl TuningWindow {
             ) else {
                 return;
             };
+            // Chroma is spent only on the measurement. This is the one place
+            // in the window that picks a saturated colour at all.
+            let accent = match signal {
+                SignalState::Good => p.good,
+                SignalState::Marginal => p.marginal,
+                SignalState::Below => p.below,
+                SignalState::NoFace => p.no_signal,
+                SignalState::Unavailable => p.dead,
+            };
+            let Some(b_accent) = brush(accent) else {
+                return;
+            };
 
             let text =
                 |s: &str, f: &IDWriteTextFormat, r_: D2D_RECT_F, b: &ID2D1SolidColorBrush| {
                     let w = wide(s);
-                    // The trailing NUL is not part of the string to draw.
                     t.DrawText(
                         &w[..w.len() - 1],
                         f,
@@ -467,36 +624,61 @@ impl TuningWindow {
                 let _ = f.SetTextAlignment(a);
             };
 
-            // ---- title bar ------------------------------------------------
+            // ---- top row: camera status ------------------------------------
+            // The native caption already says VISOR; a second wordmark under it
+            // was just brand noise. This row carries the one fact worth the
+            // space, and it agrees with the hardware LED at all times.
+            let (cam_label, cam_dot) = if self.preview_on.get() {
+                ("Camera on \u{00B7} local only", p.good)
+            } else {
+                ("Camera off", p.dead)
+            };
+            if let Some(b_dot) = brush(cam_dot) {
+                let dot = D2D1_ROUNDED_RECT {
+                    rect: rect(MARGIN, 17.0, MARGIN + 7.0, 24.0),
+                    radiusX: 3.5,
+                    radiusY: 3.5,
+                };
+                t.FillRoundedRectangle(&dot, &b_dot);
+            }
             text(
-                "V I S O R",
-                &r.fonts.wordmark,
-                rect(MARGIN, 12.0, 200.0, 32.0),
-                &b_t1,
+                cam_label,
+                &r.fonts.caption,
+                rect(MARGIN + 14.0, 13.0, CONTENT_R, 32.0),
+                &b_t2,
             );
             t.FillRectangle(&rect(0.0, 39.0, WIN_W, 40.0), &b_hair);
 
-            // ---- status band ----------------------------------------------
-            let dot = D2D1_ROUNDED_RECT {
-                rect: rect(MARGIN, 62.0, MARGIN + 8.0, 70.0),
-                radiusX: 4.0,
-                radiusY: 4.0,
+            // ---- status band ------------------------------------------------
+            let (name, sub) = state_copy(st.state, st.dim_level);
+            let dot_colour = match st.state {
+                State::Active => p.good,
+                State::Degraded => p.warn_text,
+                State::Paused => p.t3,
+                _ => p.t1,
             };
-            t.FillRoundedRectangle(&dot, &b_t1);
+            if let Some(b_dot) = brush(dot_colour) {
+                let dot = D2D1_ROUNDED_RECT {
+                    rect: rect(MARGIN, 62.0, MARGIN + 8.0, 70.0),
+                    radiusX: 4.0,
+                    radiusY: 4.0,
+                };
+                t.FillRoundedRectangle(&dot, &b_dot);
+            }
+            let b_name = if st.state == State::Degraded {
+                brush(p.warn_text).unwrap_or_else(|| b_t1.clone())
+            } else {
+                b_t1.clone()
+            };
+            text(name, &r.fonts.title, rect(38.0, 53.0, 320.0, 80.0), &b_name);
             text(
-                "Watching",
-                &r.fonts.title,
-                rect(38.0, 53.0, 300.0, 80.0),
-                &b_t1,
-            );
-            text(
-                "Camera open, watching for absence.",
+                &sub,
                 &r.fonts.caption,
-                rect(MARGIN, 79.0, CONTENT_R, 96.0),
+                rect(MARGIN, 80.0, CONTENT_R, 100.0),
                 &b_t2,
             );
 
-            // ---- preview plate --------------------------------------------
+            // ---- plate --------------------------------------------------------
             let plate = D2D1_ROUNDED_RECT {
                 rect: rect(PLATE.0, PLATE.1, PLATE.2, PLATE.3),
                 radiusX: 10.0,
@@ -508,16 +690,19 @@ impl TuningWindow {
             t.DrawRoundedRectangle(&plate, &b_hair, 1.0, None);
             align(&r.fonts.body, DWRITE_TEXT_ALIGNMENT_LEADING);
 
+            // The gauge is aligned to the VIDEO, not the plate: with a
+            // letterboxed frame the two differ, and the caliper-to-gauge link
+            // is only honest if a height on the left means the same height on
+            // the right.
+            let mut extent = (PLATE.1, PLATE.3);
+
             let frame = self.frame.borrow();
             if let Some(f) = frame.as_ref().filter(|f| f.width > 0 && f.height > 0) {
-                // Letterbox, never crop. `largest_ratio` is FaceBox.Height over
-                // the FRAME height, so cropping to fill would change the
-                // effective height and the ratio drawn would stop matching the
-                // ratio measured -- the one thing this window must not do.
                 let (pw, ph) = (PLATE.2 - PLATE.0, PLATE.3 - PLATE.1);
                 let scale = (pw / f.width as f32).min(ph / f.height as f32);
                 let (dw, dh) = (f.width as f32 * scale, f.height as f32 * scale);
                 let (dx, dy) = (PLATE.0 + (pw - dw) / 2.0, PLATE.1 + (ph - dh) / 2.0);
+                extent = (dy, dy + dh);
 
                 if let Some(bmp) = self.upload(t, f) {
                     t.DrawBitmap(
@@ -529,135 +714,189 @@ impl TuningWindow {
                     );
                 }
 
-                // Corner brackets, not a rectangle: brackets read as a
-                // viewfinder, a closed box reads as surveillance.
-                if let Some(b_good) = brush(p.good) {
-                    for fb in &f.faces {
-                        let (bx, by) = (dx + fb.x as f32 * scale, dy + fb.y as f32 * scale);
-                        let (bw2, bh2) = (fb.w as f32 * scale, fb.h as f32 * scale);
-                        let arm = (bh2 / 4.0).clamp(4.0, 18.0);
-                        for (cx, cy, sx, sy) in [
-                            (bx, by, 1.0f32, 1.0f32),
-                            (bx + bw2, by, -1.0, 1.0),
-                            (bx, by + bh2, 1.0, -1.0),
-                            (bx + bw2, by + bh2, -1.0, -1.0),
-                        ] {
-                            t.DrawLine(
-                                D2D_POINT_2F { x: cx, y: cy },
-                                D2D_POINT_2F {
-                                    x: cx + arm * sx,
-                                    y: cy,
-                                },
-                                &b_good,
-                                2.0,
-                                None,
-                            );
-                            t.DrawLine(
-                                D2D_POINT_2F { x: cx, y: cy },
-                                D2D_POINT_2F {
-                                    x: cx,
-                                    y: cy + arm * sy,
-                                },
-                                &b_good,
-                                2.0,
-                                None,
-                            );
-                        }
+                for fb in &f.faces {
+                    let (bx, by) = (dx + fb.x as f32 * scale, dy + fb.y as f32 * scale);
+                    let (bw2, bh2) = (fb.w as f32 * scale, fb.h as f32 * scale);
+                    let arm = (bh2 / 4.0).clamp(4.0, 18.0);
+                    for (cx, cy, sx, sy) in [
+                        (bx, by, 1.0f32, 1.0f32),
+                        (bx + bw2, by, -1.0, 1.0),
+                        (bx, by + bh2, 1.0, -1.0),
+                        (bx + bw2, by + bh2, -1.0, -1.0),
+                    ] {
+                        t.DrawLine(
+                            D2D_POINT_2F { x: cx, y: cy },
+                            D2D_POINT_2F {
+                                x: cx + arm * sx,
+                                y: cy,
+                            },
+                            &b_accent,
+                            2.0,
+                            None,
+                        );
+                        t.DrawLine(
+                            D2D_POINT_2F { x: cx, y: cy },
+                            D2D_POINT_2F {
+                                x: cx,
+                                y: cy + arm * sy,
+                            },
+                            &b_accent,
+                            2.0,
+                            None,
+                        );
                     }
                 }
 
-                // The scrim carrying the promise that none of this is acted on.
                 if let Some(b_scrim) = brush(Rgb(0, 0, 0)) {
-                    t.FillRectangle(&rect(PLATE.0 + 1.0, 322.0, PLATE.2 - 1.0, 347.0), &b_scrim);
+                    t.FillRectangle(&rect(PLATE.0 + 1.0, 323.0, PLATE.2 - 1.0, 347.0), &b_scrim);
                 }
                 text(
-                    "Tuning — VISOR will not dim while the preview is on.",
+                    "Tuning \u{2014} VISOR will not dim while the preview is on.",
                     &r.fonts.micro,
-                    rect(PLATE.0 + 10.0, 328.0, PLATE.2, 344.0),
+                    rect(PLATE.0 + 10.0, 329.0, PLATE.2, 345.0),
                     &b_t2,
                 );
             } else {
                 text(
                     "Camera is closed",
                     &r.fonts.body,
-                    rect(PLATE.0 + 100.0, 196.0, PLATE.2, 220.0),
+                    rect(PLATE.0 + 104.0, 196.0, PLATE.2, 220.0),
                     &b_t2,
                 );
                 text(
-                    "VISOR opens it only after 30 s without keyboard or mouse. Nothing it sees ever leaves this PC.",
+                    "VISOR opens it only after your keyboard and mouse go idle. Nothing it sees ever leaves this PC.",
                     &r.fonts.caption,
-                    rect(PLATE.0 + 50.0, 222.0, PLATE.2 - 50.0, 274.0),
+                    rect(PLATE.0 + 40.0, 222.0, PLATE.2 - 40.0, 262.0),
                     &b_t3,
                 );
             }
 
-            // The preview toggle, drawn from the same rect the hit test uses.
-            let btn = D2D1_ROUNDED_RECT {
-                rect: rect(PREVIEW_BTN.0, PREVIEW_BTN.1, PREVIEW_BTN.2, PREVIEW_BTN.3),
+            let btn = self.preview_btn();
+            let btn_r = D2D1_ROUNDED_RECT {
+                rect: rect(btn.0, btn.1, btn.2, btn.3),
                 radiusX: 6.0,
                 radiusY: 6.0,
             };
-            t.DrawRoundedRectangle(&btn, &b_strong, 1.0, None);
+            if self.preview_on.get() {
+                // Over live video the button needs its own ground or it is
+                // unreadable against whatever happens to be behind it.
+                if let Some(b_bg) = brush(p.surface) {
+                    t.FillRoundedRectangle(&btn_r, &b_bg);
+                }
+            }
+            t.DrawRoundedRectangle(&btn_r, &b_strong, 1.0, None);
+            align(&r.fonts.caption, DWRITE_TEXT_ALIGNMENT_LEADING);
             text(
                 if self.preview_on.get() {
                     "Turn off preview"
                 } else {
                     "Turn on preview"
                 },
-                &r.fonts.body,
-                rect(
-                    PREVIEW_BTN.0 + 14.0,
-                    PREVIEW_BTN.1 + 5.0,
-                    PREVIEW_BTN.2,
-                    PREVIEW_BTN.3,
-                ),
+                &r.fonts.caption,
+                rect(btn.0 + 12.0, btn.1 + 4.0, btn.2, btn.3),
                 &b_t1,
             );
+            drop(frame);
 
-            // ---- gauge column ---------------------------------------------
+            // ---- gauge --------------------------------------------------------
+            let (gt, gb) = extent;
+            let span = (gb - gt).max(1.0);
+            let y_of = |v: f32| gb - (v / GAUGE_TOP).clamp(0.0, 1.0) * span;
+
             let track = D2D1_ROUNDED_RECT {
-                rect: rect(362.0, 138.0, 382.0, 318.0),
+                rect: rect(362.0, gt, 382.0, gb),
                 radiusX: 10.0,
                 radiusY: 10.0,
             };
             t.FillRoundedRectangle(&track, &b_well);
             t.DrawRoundedRectangle(&track, &b_hair, 1.0, None);
-            // the user's line
-            t.FillRectangle(&rect(354.0, 273.0, 398.0, 274.5), &b_t1);
 
-            // ---- readout ---------------------------------------------------
+            if let (Some(lo), Some(hi)) = (low, self.envelope.borrow().max())
+                && let Ok(band) = t.CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        a: 0.28,
+                        ..colour(accent)
+                    },
+                    None,
+                )
+            {
+                t.FillRectangle(&rect(358.0, y_of(hi), 386.0, y_of(lo)), &band);
+            }
+
+            if let Some(v) = shown {
+                t.FillRectangle(&rect(363.0, y_of(v), 381.0, gb - 1.0), &b_accent);
+            }
+            // The envelope minimum gets its own tick: it is the number that
+            // actually decides whether VISOR will dim on you.
+            if let Some(lo) = low {
+                t.FillRectangle(
+                    &rect(358.0, y_of(lo) - 0.5, 386.0, y_of(lo) + 0.5),
+                    &b_accent,
+                );
+            }
+
+            // The user's line. Neutral: it is not a measurement.
+            let ty = y_of(st.threshold);
+            t.FillRectangle(&rect(354.0, ty - 0.75, 398.0, ty + 0.75), &b_t1);
+            let grip = D2D1_ROUNDED_RECT {
+                rect: rect(356.0, ty - 5.0, 388.0, ty + 5.0),
+                radiusX: 3.0,
+                radiusY: 3.0,
+            };
+            t.FillRoundedRectangle(&grip, &b_t1);
+
+            // ---- readout ------------------------------------------------------
+            let measured = match shown {
+                Some(v) => format!("{v:.2}"),
+                None => "\u{2014}".to_string(),
+            };
             text(
-                "\u{2014} / 0.15",
+                &measured,
                 &r.fonts.numeral,
-                rect(MARGIN, 353.0, CONTENT_R, 392.0),
+                rect(MARGIN, 353.0, 140.0, 392.0),
+                &b_accent,
+            );
+            text(
+                &format!("/ {:.2}", st.threshold),
+                &r.fonts.numeral,
+                rect(100.0, 353.0, CONTENT_R, 392.0),
                 &b_t3,
             );
             text(
-                "Turn on the preview to check what VISOR can see.",
+                &verdict(signal, low, st.threshold),
                 &r.fonts.body,
-                rect(MARGIN, 388.0, CONTENT_R, 408.0),
+                rect(MARGIN, 392.0, CONTENT_R, 414.0),
                 &b_t2,
             );
 
-            // ---- sequence ---------------------------------------------------
+            // ---- sequence -----------------------------------------------------
             text(
                 "S E Q U E N C E",
                 &r.fonts.section,
                 rect(MARGIN, 424.0, CONTENT_R, 440.0),
                 &b_t3,
             );
-            self.draw_rail(t, p, &b_hair, &b_strong, &b_t3);
+            self.draw_rail(t, p, &b_hair, &b_strong, st.dim_level);
 
-            // ---- dim level ---------------------------------------------------
+            // ---- dim level ----------------------------------------------------
             text(
                 "Dim to",
                 &r.fonts.caption,
                 rect(MARGIN, 548.0, 74.0, 566.0),
                 &b_t2,
             );
+            let bar = D2D1_ROUNDED_RECT {
+                rect: rect(74.0, 552.0, 330.0, 560.0),
+                radiusX: 4.0,
+                radiusY: 4.0,
+            };
+            if let Some(b_dim) = brush(crate::ui::theme::dim_fill(p, st.dim_level)) {
+                t.FillRoundedRectangle(&bar, &b_dim);
+            }
+            t.DrawRoundedRectangle(&bar, &b_hair, 1.0, None);
             align(&r.fonts.body_strong, DWRITE_TEXT_ALIGNMENT_TRAILING);
             text(
-                "20%",
+                &format!("{}%", st.dim_level),
                 &r.fonts.body_strong,
                 rect(300.0, 547.0, CONTENT_R, 566.0),
                 &b_t1,
@@ -671,23 +910,34 @@ impl TuningWindow {
                 rect(MARGIN, 586.0, CONTENT_R, 602.0),
                 &b_t3,
             );
+            let (mech, how) = diagnostics(&st);
             text(
-                "Probing\u{2026}",
+                &mech,
                 &r.fonts.caption,
-                rect(MARGIN, 606.0, CONTENT_R, 624.0),
+                rect(MARGIN, 604.0, CONTENT_R, 622.0),
                 &b_t2,
+            );
+            text(
+                &how,
+                &r.fonts.caption,
+                rect(MARGIN, 622.0, CONTENT_R, 650.0),
+                &b_t3,
             );
 
             // ---- footer -------------------------------------------------------
             t.FillRectangle(&rect(0.0, 654.0, WIN_W, 655.0), &b_hair);
-            for (label, x, w) in [("Pause", MARGIN, 76.0), ("Reload config", 106.0, 106.0)] {
+            let pause_label = if st.state == State::Paused {
+                "Resume"
+            } else {
+                "Pause"
+            };
+            for (label, x, w) in [(pause_label, MARGIN, 76.0), ("Reload config", 106.0, 106.0)] {
                 let b = D2D1_ROUNDED_RECT {
                     rect: rect(x, 662.0, x + w, 690.0),
                     radiusX: 6.0,
                     radiusY: 6.0,
                 };
                 t.DrawRoundedRectangle(&b, &b_strong, 1.0, None);
-                align(&r.fonts.body, DWRITE_TEXT_ALIGNMENT_LEADING);
                 text(
                     label,
                     &r.fonts.body,
@@ -709,7 +959,7 @@ impl TuningWindow {
         p: &Palette,
         hair: &ID2D1SolidColorBrush,
         strong: &ID2D1SolidColorBrush,
-        _t3: &ID2D1SolidColorBrush,
+        dim_level: u8,
     ) {
         // SAFETY: caller guarantees a live draw pass.
         unsafe {
@@ -718,42 +968,103 @@ impl TuningWindow {
                 radiusX: 6.0,
                 radiusY: 6.0,
             };
-            // Rounded outer ends with square inner seams: clip to the rounded
-            // track, then fill plain rectangles inside it. Direct2D has no
-            // per-corner radius, and this is the cheapest way to get one.
-            if let Ok(geo) = self.d2d.CreateRoundedRectangleGeometry(&outline) {
-                let layer = t.CreateLayer(None).ok();
-                if let Some(layer) = layer {
-                    let params = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
-                        contentBounds: outline.rect,
-                        geometricMask: std::mem::ManuallyDrop::new(Some(geo.into())),
-                        maskAntialiasMode:
-                            windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        maskTransform: windows::Foundation::Numerics::Matrix3x2::identity(),
-                        opacity: 1.0,
-                        opacityBrush: std::mem::ManuallyDrop::new(None),
-                        layerOptions: windows::Win32::Graphics::Direct2D::D2D1_LAYER_OPTIONS_NONE,
-                    };
-                    t.PushLayer(&params, &layer);
+            if let Ok(geo) = self.d2d.CreateRoundedRectangleGeometry(&outline)
+                && let Ok(layer) = t.CreateLayer(None)
+            {
+                let params = windows::Win32::Graphics::Direct2D::D2D1_LAYER_PARAMETERS {
+                    contentBounds: outline.rect,
+                    geometricMask: std::mem::ManuallyDrop::new(Some(geo.into())),
+                    maskAntialiasMode:
+                        windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: windows::Foundation::Numerics::Matrix3x2::identity(),
+                    opacity: 1.0,
+                    opacityBrush: std::mem::ManuallyDrop::new(None),
+                    layerOptions: windows::Win32::Graphics::Direct2D::D2D1_LAYER_OPTIONS_NONE,
+                };
+                t.PushLayer(&params, &layer);
 
-                    let seg = |x0: f32, x1: f32, c: Rgb| {
-                        if let Ok(b) = t.CreateSolidColorBrush(&colour(c), None) {
-                            t.FillRectangle(&rect(x0, 477.0, x1, 503.0), &b);
-                        }
-                    };
-                    // Defaults from config: camera opens at 30s, dim +20s,
-                    // black +45s, off +15m -- laid out on the spec's log axis.
-                    seg(MARGIN, 128.0, p.level_full);
-                    seg(128.0, 156.0, p.level_full);
-                    seg(156.0, 178.0, crate::ui::theme::dim_fill(p, 20));
-                    seg(178.0, CONTENT_R, p.level_black);
-                    t.PopLayer();
-                }
+                let seg = |x0: f32, x1: f32, c: Rgb| {
+                    if let Ok(b) = t.CreateSolidColorBrush(&colour(c), None) {
+                        t.FillRectangle(&rect(x0, 477.0, x1, 503.0), &b);
+                    }
+                };
+                seg(MARGIN, 156.0, p.level_full);
+                seg(156.0, 178.0, crate::ui::theme::dim_fill(p, dim_level));
+                seg(178.0, CONTENT_R, p.level_black);
+                t.PopLayer();
             }
             t.DrawRoundedRectangle(&outline, hair, 1.0, None);
-            // the "powered down" tail gets an outline rather than a colour
             t.FillRectangle(&rect(316.0, 477.0, 317.0, 503.0), strong);
         }
+    }
+}
+
+/// The top of the gauge's scale. Real faces live in 0.05..0.45; 0.60 gives
+/// headroom without wasting two thirds of the column.
+const GAUGE_TOP: f32 = 0.60;
+
+/// Name and sub-line for a state. Says the consequence, never the mechanism.
+fn state_copy(state: State, dim_level: u8) -> (&'static str, String) {
+    match state {
+        State::Active => ("Active", "You are here \u{2014} camera closed.".into()),
+        State::Watching => ("Watching", "Camera open, watching for absence.".into()),
+        State::Dimmed => ("Dimmed", format!("Screen at {dim_level}%.")),
+        State::Away => ("Away", "Screen black, panel still powered.".into()),
+        State::Deep => ("Deep", "Monitor powered down.".into()),
+        State::Paused => ("Paused", "Nothing will dim until you resume.".into()),
+        State::Degraded => ("Degraded", "Camera failed \u{2014} dimming is off.".into()),
+    }
+}
+
+/// One sentence saying what the measurement means for the user.
+fn verdict(signal: SignalState, low: Option<f32>, threshold: f32) -> String {
+    match (signal, low) {
+        (SignalState::Good, Some(lo)) => {
+            let head = ((lo / threshold - 1.0) * 100.0).round() as i32;
+            format!("Clear by {head}% \u{2014} lowest reading {lo:.2}.")
+        }
+        (SignalState::Marginal, Some(lo)) => {
+            let head = ((lo / threshold - 1.0) * 100.0).round() as i32;
+            format!(
+                "Only {head}% above the line \u{2014} one lean back and VISOR will think you left. Try {:.2}.",
+                suggested(lo)
+            )
+        }
+        (SignalState::Below, Some(lo)) => format!(
+            "Too small \u{2014} VISOR would treat you as away. Try min_face_ratio {:.2}.",
+            suggested(lo)
+        ),
+        (SignalState::NoFace, _) => {
+            "Camera is running but sees no face. Check the angle and the lighting.".into()
+        }
+        (SignalState::Unavailable, _) => "Turn on the preview to check what VISOR can see.".into(),
+        _ => String::new(),
+    }
+}
+
+/// The two diagnostic lines. A fact with a consequence, not a warning.
+fn diagnostics(st: &WindowStatus) -> (String, String) {
+    let monitor = if st.monitor.is_empty() {
+        "no monitor selected".to_string()
+    } else {
+        st.monitor.clone()
+    };
+    if st.ddc && st.brightness_confirmed {
+        (
+            format!("[DDC/CI]  {monitor}"),
+            format!("Backlight dimming to {}%.", st.dim_level),
+        )
+    } else if st.ddc {
+        (
+            format!("[DDC/CI]  {monitor}"),
+            "Brightness writes are not confirmed (HDR?) \u{2014} dimming uses a black overlay."
+                .into(),
+        )
+    } else {
+        (
+            format!("[Overlay]  {monitor}"),
+            "No DDC/CI on this monitor \u{2014} VISOR covers the screen instead of dimming the backlight.".into(),
+        )
     }
 }
 
@@ -816,6 +1127,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             }
             // Closing hides to the tray; VISOR keeps running. Quitting is a
             // separate, deliberate act from the tray menu or the footer.
+            // The client can still change size under us (DPI moves, a theme
+            // change). A render target left at the old size stretches or
+            // clips everything, so follow it.
+            WM_SIZE => {
+                if let Some(this) = this
+                    && let Some(r) = this.renderer.borrow().as_ref()
+                {
+                    let w = (l.0 & 0xFFFF) as u32;
+                    let h = ((l.0 >> 16) & 0xFFFF) as u32;
+                    if w > 0 && h > 0 {
+                        let _ = r.target.Resize(&D2D_SIZE_U {
+                            width: w,
+                            height: h,
+                        });
+                    }
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONDOWN => {
                 if let Some(this) = this {
                     let x = (l.0 & 0xFFFF) as i16 as f32;
@@ -897,13 +1226,28 @@ mod tests {
         // One rect feeds both the painter and the hit test. Two copies of
         // these numbers is exactly how a button ends up drawn in one place
         // and clickable in another.
-        let (l, t, r, b) = PREVIEW_BTN;
-        assert!(hit(PREVIEW_BTN, (l + r) / 2.0, (t + b) / 2.0), "centre");
-        assert!(hit(PREVIEW_BTN, l, t), "top-left corner is inside");
-        assert!(!hit(PREVIEW_BTN, r, b), "bottom-right is exclusive");
-        assert!(!hit(PREVIEW_BTN, l - 1.0, (t + b) / 2.0));
-        // And it sits within the plate it is drawn on.
-        assert!(l >= PLATE.0 && r <= PLATE.2 && t >= PLATE.1 && b <= PLATE.3);
+        let (l, t, r, b) = PREVIEW_BTN_IDLE;
+        assert!(
+            hit(PREVIEW_BTN_IDLE, (l + r) / 2.0, (t + b) / 2.0),
+            "centre"
+        );
+        assert!(hit(PREVIEW_BTN_IDLE, l, t), "top-left corner is inside");
+        assert!(!hit(PREVIEW_BTN_IDLE, r, b), "bottom-right is exclusive");
+        assert!(!hit(PREVIEW_BTN_IDLE, l - 1.0, (t + b) / 2.0));
+        // Both positions sit within the plate they are drawn on.
+        for (bl, bt, br, bb) in [PREVIEW_BTN_IDLE, PREVIEW_BTN_LIVE] {
+            assert!(
+                bl >= PLATE.0 && br <= PLATE.2 && bt >= PLATE.1 && bb <= PLATE.3,
+                "button {bl},{bt},{br},{bb} escapes the plate"
+            );
+        }
+        // The live position must clear the middle of the plate, or it lands on
+        // the face it is supposed to let you see.
+        let (_, _, _, live_bottom) = PREVIEW_BTN_LIVE;
+        assert!(
+            live_bottom < (PLATE.1 + PLATE.3) / 2.0,
+            "the live button must stay out of the centre of the frame"
+        );
     }
 
     #[test]
@@ -916,14 +1260,23 @@ mod tests {
         };
         assert_eq!(w.take_preview_request(), None, "nothing pending at rest");
 
-        let (l, t, r, b) = PREVIEW_BTN;
+        let (l, t, r, b) = PREVIEW_BTN_IDLE;
         w.on_click((l + r) / 2.0, (t + b) / 2.0);
         assert_eq!(w.take_preview_request(), Some(true));
         assert_eq!(w.take_preview_request(), None, "draining consumes it");
 
-        // Nothing changed until the pump says so.
+        // Once live the button MOVES off the middle of the plate, because the
+        // middle of the plate is now the user's face. The old spot must go
+        // dead and the new one must work.
         w.set_preview_state(true);
         w.on_click((l + r) / 2.0, (t + b) / 2.0);
+        assert_eq!(
+            w.take_preview_request(),
+            None,
+            "the idle position must not stay clickable once the button moved"
+        );
+        let (l2, t2, r2, b2) = PREVIEW_BTN_LIVE;
+        w.on_click((l2 + r2) / 2.0, (t2 + b2) / 2.0);
         assert_eq!(w.take_preview_request(), Some(false), "it toggles");
     }
 

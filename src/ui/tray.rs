@@ -4,7 +4,7 @@ use crate::core::engine::CheckSlot;
 use crate::core::types::{Command, DisplayLevel, State};
 use crate::error::{Result, VisorError};
 use crate::ui::theme::Theme;
-use crate::ui::window::TuningWindow;
+use crate::ui::window::{TuningWindow, WindowStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -142,6 +142,10 @@ pub fn run(
     if tuning_window.is_none() {
         tracing::warn!("tuning window unavailable; VISOR continues without it");
     }
+    // The thresholds the window draws come from the same config the engine
+    // reads, so the line on screen is the line being enforced. Re-read on
+    // reload alongside the theme.
+    let mut cfg = crate::config::Config::load_or_default(&crate::config::Config::default_path());
 
     loop {
         // Pump Win32 messages — tray-icon delivers its events through them.
@@ -182,11 +186,11 @@ pub fn run(
                 if c == Command::Reload {
                     // Re-read the theme too: it lives in the same file, and a
                     // reload that ignored it would make the setting look broken.
-                    let fresh = crate::config::Config::load_or_default(
+                    cfg = crate::config::Config::load_or_default(
                         &crate::config::Config::default_path(),
                     );
                     if let Some(w) = tuning_window.as_ref() {
-                        w.set_theme(Theme::parse(&fresh.ui.theme));
+                        w.set_theme(Theme::parse(&cfg.ui.theme));
                     }
                     // Ruling F8: the `Resolver` lives on this thread, not the
                     // engine's, so a reload has to be actioned here too —
@@ -251,6 +255,24 @@ pub fn run(
                 return Ok(());
             }
             w.set_preview_state(on);
+        }
+
+        // Push the rest of VISOR at the window. `set_status` no-ops unless
+        // something actually changed, so this does not repaint every 250ms.
+        if let Some(w) = tuning_window.as_ref()
+            && w.is_visible()
+        {
+            let (monitor, ddc, confirmed) = resolver
+                .primary()
+                .unwrap_or_else(|| (String::new(), false, false));
+            w.set_status(WindowStatus {
+                state: State::from_u8(status.load(Ordering::Relaxed)),
+                threshold: cfg.presence.min_face_ratio,
+                dim_level: cfg.display.dim_level,
+                monitor,
+                ddc,
+                brightness_confirmed: confirmed,
+            });
         }
 
         // A camera-check result outranks the state tooltip for a few seconds:
