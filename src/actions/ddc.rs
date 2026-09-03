@@ -151,10 +151,33 @@ impl DdcMonitor {
     /// Writes the brightness saved at `open` time back to the panel.
     /// Returns `false` if brightness was never readable at `open`.
     pub fn restore_brightness(&mut self) -> bool {
-        match self.saved {
-            Some(saved) => self.write_vcp(VCP_BRIGHTNESS, saved),
+        let Some(saved) = self.saved else {
+            return false;
+        };
+        if !self.write_vcp(VCP_BRIGHTNESS, saved) {
+            return false;
+        }
+        // Read back, exactly as `set_brightness` does. The asymmetry used to
+        // run the other way: this returned whether the WRITE call succeeded,
+        // so a panel that accepted the write without acting on it -- which is
+        // precisely the Windows HDR failure mode `set_brightness` exists to
+        // catch -- reported a restore that never happened. Everything
+        // downstream now depends on this answer being about the panel's state
+        // rather than about the call's return value: `rescan` decides whether
+        // it may adopt what it reads based on it.
+        match self.read_vcp(VCP_BRIGHTNESS) {
+            Some(actual) => actual.abs_diff(saved) <= BRIGHTNESS_TOLERANCE,
             None => false,
         }
+    }
+
+    /// Replace the restore point with one carried over from a previous handle.
+    ///
+    /// Used only by `Resolver::rescan`, when a restore did not confirm and the
+    /// value this handle read at `open` is therefore the dim rather than the
+    /// user's brightness. See `brightness_to_keep`.
+    pub fn adopt_saved(&mut self, value: Option<u32>) {
+        self.saved = value;
     }
 
     /// Powers the panel on or off. Only ever writes VCP value 1 (on) or 4

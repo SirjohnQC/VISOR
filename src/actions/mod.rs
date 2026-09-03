@@ -78,6 +78,29 @@ fn restore_attempts(has_saved: bool) -> usize {
     if has_saved { 5 } else { 0 }
 }
 
+/// What a rescan should keep as the restore point for a monitor.
+///
+/// `DdcMonitor::open` reads the panel's current brightness and treats it as the
+/// user's. That is only true when the panel is actually at the user's
+/// brightness, which is why `rescan` restores before it re-opens. When the
+/// restore did not confirm, the panel is still dim and the fresh read is a dim
+/// value, so the value known before the rescan is the better answer.
+///
+/// Keeping the previous value rather than dropping it also matters because
+/// `restore_attempts` returns 0 when nothing is saved: a lost brightness is not
+/// merely unknown, it disables every future restore for that monitor.
+pub fn brightness_to_keep(
+    previous: Option<u32>,
+    restore_confirmed: bool,
+    fresh: Option<u32>,
+) -> Option<u32> {
+    if restore_confirmed {
+        fresh.or(previous)
+    } else {
+        previous.or(fresh)
+    }
+}
+
 /// What `Engine` holds instead of the real display stack.
 ///
 /// Ruling F8: the resolver cannot live on the engine thread. Overlay windows
@@ -158,7 +181,20 @@ impl Resolver {
     /// back to the saved value before discarding the handles that know it is
     /// what keeps the readback honest.
     pub fn rescan(&mut self) {
-        self.restore();
+        let restored = self.restore();
+        // Captured before the old handles are dropped: if the restore did not
+        // confirm, the panel is still at the dim level and the value the new
+        // handle is about to read is that dim, not the user's brightness.
+        let previous: Vec<(String, Option<u32>)> = self
+            .targets
+            .iter()
+            .map(|t| {
+                (
+                    t.description.clone(),
+                    t.ddc.as_ref().and_then(|d| d.saved_brightness()),
+                )
+            })
+            .collect();
 
         let all = monitors::enumerate();
         self.attached = all.len();
@@ -166,7 +202,24 @@ impl Resolver {
         self.targets = chosen
             .into_iter()
             .map(|m| {
-                let ddc = ddc::DdcMonitor::open(m.handle);
+                let mut ddc = ddc::DdcMonitor::open(m.handle);
+                if let Some(d) = ddc.as_mut() {
+                    let prev = previous
+                        .iter()
+                        .find(|(desc, _)| *desc == m.description)
+                        .and_then(|(_, b)| *b);
+                    let fresh = d.saved_brightness();
+                    let keep = brightness_to_keep(prev, restored, fresh);
+                    if keep != fresh {
+                        tracing::warn!(
+                            monitor = %m.description,
+                            read = ?fresh,
+                            kept = ?keep,
+                            "restore did not confirm; keeping the brightness known                              before the rescan rather than adopting a dim one"
+                        );
+                        d.adopt_saved(keep);
+                    }
+                }
                 // Assume capable until proven otherwise; the readback in
                 // `set_brightness` is what actually decides, per operation.
                 let cap = DdcCapability {
@@ -223,7 +276,12 @@ impl Resolver {
     }
 
     /// Spec §6.2 — restore in a fixed order rather than by picking a mechanism.
-    fn restore(&mut self) {
+    ///
+    /// Returns whether the panel is now known to be at the user's brightness.
+    /// `rescan` needs that answer before it may adopt what a fresh handle
+    /// reads; a monitor with nothing saved to restore reports `true`, because
+    /// it was never dimmed over DDC and so cannot be sitting at a dim value.
+    fn restore(&mut self) -> bool {
         // 1. Drop the overlay first; it is the fastest thing to undo.
         self.overlay.apply(DisplayLevel::Full);
 
@@ -242,6 +300,7 @@ impl Resolver {
 
         // 3. Restore brightness, retried with backoff: a panel that has just
         //    woken often rejects VCP writes for a moment.
+        let mut confirmed = true;
         for t in &mut self.targets {
             let Some(d) = t.ddc.as_mut() else { continue };
             let attempts = restore_attempts(d.saved_brightness().is_some());
@@ -264,8 +323,10 @@ impl Resolver {
             }
             if !restored {
                 tracing::warn!(monitor = %t.description, "brightness restore never confirmed");
+                confirmed = false;
             }
         }
+        confirmed
     }
 }
 
@@ -551,6 +612,43 @@ mod resolver_tests {
         drop(rx);
         let mut d = ChannelDisplay { tx };
         d.apply(DisplayLevel::Black); // must not panic
+    }
+}
+
+#[cfg(test)]
+mod rescan_brightness {
+    use super::brightness_to_keep;
+
+    #[test]
+    fn a_failed_restore_must_not_let_a_rescan_capture_the_dim() {
+        // `DdcMonitor::open` takes whatever the panel currently reports as the
+        // user's brightness. `rescan` restores first so that capture is
+        // honest -- but `restore` can fail, and then the panel is still
+        // sitting at the dim level when the new handle reads it.
+        //
+        // Capturing THAT makes 20% the new "full", and the next dim takes 20%
+        // OF IT: the 100 -> 20 -> 4 -> 1 walk-down the `rescan` doc comment
+        // warns about, ending somewhere only the monitor's own OSD can undo.
+        // This happened on 2026-09-03 -- the panel refused the read, so the
+        // value was lost rather than corrupted, which was luck, not design.
+        assert_eq!(brightness_to_keep(Some(80), false, Some(16)), Some(80));
+
+        // A confirmed restore means the panel really is back at the user's
+        // brightness, so the fresh read is the truth and a brightness the user
+        // changed at the OSD meanwhile is picked up.
+        assert_eq!(brightness_to_keep(Some(80), true, Some(90)), Some(90));
+
+        // A panel that refuses the read after a failed restore must not lose
+        // the value already known. Losing it makes `restore_attempts` return
+        // 0, and then every later restore skips silently -- the panel stays
+        // dim and nothing in the log says why.
+        assert_eq!(brightness_to_keep(Some(80), false, None), Some(80));
+
+        // Nothing saved before means nothing was ever dimmed over DDC, so a
+        // fresh read cannot be a dim value and is safe to adopt.
+        assert_eq!(brightness_to_keep(None, true, Some(75)), Some(75));
+        assert_eq!(brightness_to_keep(None, false, Some(75)), Some(75));
+        assert_eq!(brightness_to_keep(None, false, None), None);
     }
 }
 
