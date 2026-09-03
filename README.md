@@ -1,18 +1,83 @@
 # VISOR
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4.svg)](#requirements)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-CE422B.svg)](Cargo.toml)
+[![No network code](https://img.shields.io/badge/network%20code-none-success.svg)](#privacy)
+
 VISOR is a lightweight Windows background application that uses your webcam
 to decide whether you are physically at the computer, then dims and
 eventually powers down the display when you are not — the way an ASUS OLED
 proximity sensor behaves, but ambient and requiring no ritual. Walk away and
 the panel fades and then goes dark; come back and it is already on.
 
-Presence is inferred from keyboard/mouse activity first. The webcam only
-opens once input has gone idle, so the camera's LED tells the literal truth
-about when VISOR is looking, and it closes again the moment you touch the
-keyboard or mouse.
-
 VISOR has no network code at all — not disabled, absent — so nothing it sees
 ever leaves the machine.
+
+## Requirements
+
+| | |
+|---|---|
+| **OS** | Windows 10 or 11 (uses WinRT face analysis, Direct2D and DDC/CI) |
+| **Toolchain** | Rust stable, 2024 edition — `rustup` default toolchain is enough |
+| **Camera** | Any webcam Windows exposes through Media Foundation |
+| **Monitor** | Optional. A DDC/CI-capable monitor gets real backlight dimming; anything else falls back to a black overlay window automatically |
+
+VISOR is Windows-only by construction, not by omission — presence, display
+control and the tray all sit directly on Win32 and WinRT.
+
+## Build and run
+
+```
+git clone https://github.com/SirjohnQC/VISOR.git
+cd VISOR
+cargo build --release
+```
+
+The binary lands at `target/release/visor.exe`. Run it and nothing visible
+happens except a tray icon — that is correct. See **Your first run** below for
+what to check before you trust it to dim on you.
+
+To run the tests, none of which need hardware:
+
+```
+cargo test --lib
+```
+
+## Before you trust it: the `Deep` state
+
+At `deep_after` (15 minutes by default) VISOR sends a **DDC/CI power-off
+command** to the monitor, and relies on the panel waking when it sends the
+power-on command back.
+
+**Not every monitor wakes reliably from a DDC power command.** If yours does
+not, you will be left with a dark panel and no software-side way to recover it
+— you would fix it at the monitor itself (power button or input select). This
+has not been verified across hardware.
+
+If you would rather not find out on your own monitor, push the state out of
+reach until you have tested it deliberately:
+
+```toml
+[presence]
+deep_after = "12h"
+```
+
+Dimming and blacking are unaffected — those use backlight control and an
+overlay window respectively, and neither can leave the panel unrecoverable.
+
+## Privacy
+
+VISOR has no network code. Not disabled, not opt-out — **absent**. There is no
+HTTP client, no socket, no async runtime, and nothing that could acquire one
+transitively; `Cargo.lock` is the proof and the dependency list is deliberately
+closed so it stays checkable. Camera frames are analysed in-process and
+discarded.
+
+The camera also stays shut while you are using the machine: it opens only
+after `idle_grace` seconds without keyboard or mouse, and closes the moment
+you touch either. The camera's own hardware LED therefore tells the literal
+truth about when VISOR is looking.
 
 ## The state ladder
 
