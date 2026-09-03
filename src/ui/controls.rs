@@ -116,6 +116,58 @@ pub const TIME_SNAPS: [f32; 16] = [
     2700.0, 3600.0,
 ];
 
+/// Round a free-dragged rail value to a step a human would have typed.
+///
+/// The rail is continuous and `Duration::from_secs_f32` is faithful, so a drag
+/// that stops between two snaps writes its float straight into the config file:
+/// `away_after = "49s 201ms 599us 121ns"` is a real line this produced. Nobody
+/// meant 599 microseconds; it is the pixel the mouse happened to be on.
+///
+/// The two steps match the axis rather than taste. Below two minutes one pixel
+/// is well under a second, so whole seconds are the finest thing worth keeping.
+/// Above it one pixel is already ~17s, so 15s steps throw away no precision the
+/// user could have expressed with the mouse in the first place.
+///
+/// Every entry in `TIME_SNAPS` is a fixed point of this function, so the magnet
+/// and the quantiser can never disagree about where a drag landed.
+pub fn quantise_seconds(secs: f32) -> f32 {
+    if secs < 120.0 {
+        secs.round()
+    } else {
+        (secs / 15.0).round() * 15.0
+    }
+}
+
+/// The step `quantise_seconds` rounds to at `secs`.
+fn step_at(secs: f32) -> f32 {
+    if secs < 120.0 { 1.0 } else { 15.0 }
+}
+
+/// Quantise the three ladder values together, keeping them strictly ordered.
+///
+/// Quantising them independently can collide. The drag clamp guarantees only
+/// `LADDER_GAP` (5s) between neighbours, and above two minutes the step is 15s,
+/// so `away = 925` and `deep = 930` both land on 930. `Config::validate` then
+/// refuses the write and the drag silently fails to save -- while the window
+/// goes on showing the value the user picked, so nothing on screen says the
+/// setting did not take.
+///
+/// Collisions are resolved by pushing the later marker up one step. That is a
+/// push, which dragging deliberately does not do; the difference is that here
+/// the alternative is not a surprising second change but no change at all.
+pub fn quantise_ladder(dim: f32, away: f32, deep: f32) -> (f32, f32, f32) {
+    let dim = quantise_seconds(dim);
+    let mut away = quantise_seconds(away);
+    if away <= dim {
+        away = dim + step_at(dim);
+    }
+    let mut deep = quantise_seconds(deep);
+    if deep <= away {
+        deep = away + step_at(away);
+    }
+    (dim, away, deep)
+}
+
 /// Keep a value at least `gap` away from a neighbour, on the given side.
 ///
 /// The three ladder thresholds must stay ordered. They **hard-clamp** rather
@@ -264,6 +316,45 @@ mod tests {
         assert_eq!(clamp_above(90.0, 45.0, 5.0), 90.0);
         // And nothing can be dragged negative.
         assert_eq!(clamp_below(1.0, 3.0, 5.0), 0.0);
+    }
+
+    #[test]
+    fn a_dragged_value_quantises_to_a_step_a_human_would_type() {
+        // The rail hands back a float and `Duration::from_secs_f32` writes it
+        // to TOML verbatim, so without this one drag leaves
+        // `away_after = "49s 201ms 599us 121ns"` in a file the user reads.
+        assert_eq!(quantise_seconds(49.2016), 49.0);
+        assert_eq!(quantise_seconds(20.4), 20.0);
+        // Above two minutes, 15s steps: nobody sets a 15-minute timeout to the
+        // second, and one pixel of the log rail is ~17s out there anyway.
+        assert_eq!(quantise_seconds(937.0), 930.0);
+        assert_eq!(quantise_seconds(930.0), 930.0);
+        // Every result must be a whole number of seconds.
+        for v in [5.3f32, 49.2016, 119.7, 121.4, 933.9, 3599.6] {
+            assert_eq!(quantise_seconds(v).fract(), 0.0, "{v} left a fraction");
+        }
+        // And it must never nudge a snapped value off its stop, or the magnet
+        // and the quantiser would fight over every drag that lands on one.
+        for s in TIME_SNAPS {
+            assert_eq!(quantise_seconds(s), s, "snap {s} moved");
+        }
+    }
+
+    #[test]
+    fn quantising_the_ladder_cannot_collide_two_markers() {
+        // The drag clamp only guarantees LADDER_GAP (5s) between neighbours,
+        // but above two minutes the quantiser steps by 15s -- so 925 and 930
+        // both land on 930, `Config::validate` refuses the write, and the drag
+        // silently fails to save while the window goes on showing what the
+        // user chose. A save that quietly does nothing is the worst outcome
+        // available here, so the quantiser has to keep the order it inherited.
+        let (dim, away, deep) = quantise_ladder(20.0, 925.0, 930.0);
+        assert!(dim < away && away < deep, "got {dim} {away} {deep}");
+        // The same collision exists below two minutes at 1s steps.
+        let (dim, away, deep) = quantise_ladder(20.2, 20.4, 26.0);
+        assert!(dim < away && away < deep, "got {dim} {away} {deep}");
+        // A ladder already legal and on-step passes through untouched.
+        assert_eq!(quantise_ladder(20.0, 45.0, 900.0), (20.0, 45.0, 900.0));
     }
 
     #[test]

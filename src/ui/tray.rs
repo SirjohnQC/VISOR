@@ -283,10 +283,17 @@ pub fn run(
             if let Some(e) = w.take_edits() {
                 cfg.presence.min_face_ratio = e.threshold;
                 cfg.display.dim_level = e.dim_level;
-                cfg.presence.idle_grace = Duration::from_secs_f32(e.idle_grace);
-                cfg.presence.dim_after = Duration::from_secs_f32(e.dim_after);
-                cfg.presence.away_after = Duration::from_secs_f32(e.away_after);
-                cfg.presence.deep_after = Duration::from_secs_f32(e.deep_after);
+                // Quantised on the way out, not on the way in: the drag stays
+                // continuous under the hand, and only what reaches the file is
+                // rounded to something the user would have typed. The ladder
+                // goes through together because rounding the three separately
+                // can collide them into a config `validate` would refuse.
+                use crate::ui::controls::{quantise_ladder, quantise_seconds};
+                let (dim, away, deep) = quantise_ladder(e.dim_after, e.away_after, e.deep_after);
+                cfg.presence.idle_grace = Duration::from_secs_f32(quantise_seconds(e.idle_grace));
+                cfg.presence.dim_after = Duration::from_secs_f32(dim);
+                cfg.presence.away_after = Duration::from_secs_f32(away);
+                cfg.presence.deep_after = Duration::from_secs_f32(deep);
                 match cfg.save(&crate::config::Config::default_path()) {
                     Ok(()) => {
                         if tx.send(Command::Reload).is_err() {
