@@ -2,6 +2,7 @@ use crate::config::DisplayConfig;
 use crate::core::types::DisplayLevel;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, SetThreadExecutionState};
 
 pub mod broadcast;
@@ -78,6 +79,29 @@ fn restore_attempts(has_saved: bool) -> usize {
     if has_saved { 5 } else { 0 }
 }
 
+/// How long to keep re-attempting a brightness restore that did not confirm.
+///
+/// Sized against an OLED compensation cycle, not against a busy panel. The
+/// inline retry in `restore` covers 1.55s, which is right for a display that is
+/// momentarily occupied; a panel waking from a DDC power-off can refuse VCP
+/// writes for minutes while it runs pixel cleaning. Measured on this machine:
+/// refused at +2s, accepted at +107s.
+const RESTORE_RETRY_FOR: Duration = Duration::from_secs(300);
+
+/// How often to re-attempt within that window.
+///
+/// Not faster, because every attempt is a blocking DDC round trip on the
+/// message-pump thread -- the same thread that owns the overlay and the tray.
+/// Five seconds of a dim screen is worth more than a pump that stutters for
+/// five minutes.
+const RESTORE_RETRY_EVERY: Duration = Duration::from_secs(5);
+
+/// Whether `tick` should re-attempt now, given how long the restore has been
+/// outstanding and how long since the last attempt.
+fn retry_now(outstanding: Duration, since_last: Duration) -> bool {
+    outstanding < RESTORE_RETRY_FOR && since_last >= RESTORE_RETRY_EVERY
+}
+
 /// What a rescan should keep as the restore point for a monitor.
 ///
 /// `DdcMonitor::open` reads the panel's current brightness and treats it as the
@@ -136,6 +160,10 @@ pub struct Resolver {
     attached: usize,
     /// Whether the panel is currently powered down, so restore knows to wake it.
     powered_off: bool,
+    /// When a brightness restore first failed to confirm, and when it was last
+    /// re-attempted. `None` means nothing is outstanding.
+    restore_failed_at: Option<Instant>,
+    last_retry: Option<Instant>,
 }
 
 struct Target {
@@ -153,6 +181,8 @@ impl Resolver {
             configured: cfg.targets.clone(),
             attached: 0,
             powered_off: false,
+            restore_failed_at: None,
+            last_retry: None,
         };
         r.rescan();
         // Start from a known-lit panel. A previous VISOR killed outright --
@@ -166,6 +196,61 @@ impl Resolver {
         r.powered_off = true;
         r.restore();
         r
+    }
+
+    /// Re-attempt a brightness restore that never confirmed.
+    ///
+    /// Called from the message pump on every poll. The pump is the only thread
+    /// allowed to touch DDC (ruling F8), and it already runs at 250ms, so this
+    /// needs no timer of its own -- it just declines to act until the interval
+    /// has passed.
+    ///
+    /// This exists because the inline retry inside `restore` is bounded by how
+    /// long the pump can be blocked, and the thing it is waiting for is not.
+    /// Sleeping 107 seconds in `restore` would freeze the tray and the overlay;
+    /// asking again every five seconds costs nothing and covers the same
+    /// window.
+    pub fn tick(&mut self) {
+        let Some(failed_at) = self.restore_failed_at else {
+            return;
+        };
+        let now = Instant::now();
+        let since_last = self
+            .last_retry
+            .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        if !retry_now(now.saturating_duration_since(failed_at), since_last) {
+            // Outside the window: stop asking, and say so once.
+            if now.saturating_duration_since(failed_at) >= RESTORE_RETRY_FOR {
+                tracing::warn!(
+                    "brightness restore never confirmed after {}s; giving up",
+                    RESTORE_RETRY_FOR.as_secs()
+                );
+                self.restore_failed_at = None;
+                self.last_retry = None;
+            }
+            return;
+        }
+        self.last_retry = Some(now);
+        let mut confirmed = true;
+        for t in &mut self.targets {
+            let Some(d) = t.ddc.as_mut() else { continue };
+            if d.saved_brightness().is_none() {
+                continue;
+            }
+            if d.restore_brightness() {
+                tracing::info!(monitor = %t.description, "brightness restore confirmed on retry");
+                // A panel that takes a brightness write is a panel that can be
+                // dimmed over DDC again; the capability was cleared by whatever
+                // refused the write in the first place.
+                t.cap.brightness_confirmed = true;
+            } else {
+                confirmed = false;
+            }
+        }
+        if confirmed {
+            self.restore_failed_at = None;
+            self.last_retry = None;
+        }
     }
 
     /// Re-enumerate monitors and rebuild the DDC handles. Task 13 calls this
@@ -325,6 +410,20 @@ impl Resolver {
                 tracing::warn!(monitor = %t.description, "brightness restore never confirmed");
                 confirmed = false;
             }
+        }
+        // Arm or disarm the re-attempt. Arming is deliberately not reset on a
+        // later failure: the window is measured from the FIRST failure, so a
+        // panel that refuses every attempt stops being asked after
+        // `RESTORE_RETRY_FOR` rather than being retried forever.
+        if confirmed {
+            if self.restore_failed_at.is_some() {
+                tracing::info!("brightness restore confirmed; stopping re-attempts");
+            }
+            self.restore_failed_at = None;
+            self.last_retry = None;
+        } else if self.restore_failed_at.is_none() {
+            self.restore_failed_at = Some(Instant::now());
+            self.last_retry = Some(Instant::now());
         }
         confirmed
     }
@@ -649,6 +748,37 @@ mod rescan_brightness {
         assert_eq!(brightness_to_keep(None, true, Some(75)), Some(75));
         assert_eq!(brightness_to_keep(None, false, Some(75)), Some(75));
         assert_eq!(brightness_to_keep(None, false, None), None);
+    }
+}
+
+#[cfg(test)]
+mod restore_retry {
+    use super::{RESTORE_RETRY_EVERY, RESTORE_RETRY_FOR, retry_now};
+    use std::time::Duration;
+
+    #[test]
+    fn a_restore_is_retried_past_the_panels_wake_window() {
+        // The inline budget is 50+100+200+400+800ms = 1.55s, sized for a panel
+        // that is briefly busy. An OLED waking from a DDC power-off runs a
+        // compensation cycle first and refuses VCP writes for far longer: on
+        // 2026-09-03 this panel refused at +2s and accepted at +107s. Nothing
+        // asked it again in between, so the screen stayed at 20% until the
+        // user touched the mouse -- in a product whose whole claim is that
+        // you do not have to.
+        assert!(retry_now(Duration::from_secs(107), RESTORE_RETRY_EVERY));
+
+        // It must not fire on the tick that scheduled it, or the pump would
+        // retry at its own 250ms poll rate.
+        assert!(!retry_now(Duration::ZERO, Duration::ZERO));
+        assert!(!retry_now(Duration::from_secs(10), RESTORE_RETRY_EVERY / 2));
+
+        // Each attempt is a blocking DDC round trip on the message-pump
+        // thread, so this gives up rather than writing VCP forever.
+        assert!(!retry_now(RESTORE_RETRY_FOR, RESTORE_RETRY_EVERY));
+        assert!(retry_now(
+            RESTORE_RETRY_FOR - Duration::from_secs(1),
+            RESTORE_RETRY_EVERY
+        ));
     }
 }
 

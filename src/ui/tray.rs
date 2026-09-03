@@ -235,6 +235,10 @@ pub fn run(
             return Ok(());
         }
 
+        // Re-attempt a brightness restore the panel refused. Normally a no-op
+        // and free; it only does DDC work while a restore is outstanding.
+        resolver.tick();
+
         // Newest preview frame wins: at 15fps several can queue while a DDC
         // write blocks the pump, and drawing the stale ones would just add
         // latency to a picture of the user moving.
