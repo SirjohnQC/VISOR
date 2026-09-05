@@ -19,6 +19,7 @@
 use crate::core::types::State;
 use crate::sense::preview::PreviewFrame;
 use crate::ui::controls::{Axis, Scale, TIME_SNAPS, clamp_above, clamp_below, snap};
+use crate::ui::settings::{self, Settings};
 use crate::ui::signal::{
     CameraStatus, Confirmation, Envelope, SMOOTH_ALPHA, SignalState, classify, quantise, smooth,
     suggested,
@@ -39,8 +40,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
-    DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -74,6 +75,24 @@ const PLATE: (f32, f32, f32, f32) = (MARGIN, 108.0, 342.0, 348.0);
 /// always ceiling or wall.
 const PREVIEW_BTN_IDLE: (f32, f32, f32, f32) = (120.0, 268.0, 244.0, 300.0);
 const PREVIEW_BTN_LIVE: (f32, f32, f32, f32) = (240.0, 116.0, 336.0, 140.0);
+
+/// Footer navigation. Right-aligned on the instrument page so it never crowds
+/// the actions, left-aligned on the settings page because "back" belongs where
+/// the eye starts a line.
+const SETTINGS_BTN: (f32, f32, f32, f32) = (312.0, 662.0, CONTENT_R, 690.0);
+const BACK_BTN: (f32, f32, f32, f32) = (MARGIN, 662.0, 88.0, 690.0);
+
+/// Which page the window is showing.
+///
+/// Not tabs: spec §4 bans those, and rightly — the instrument face must not
+/// grow chrome for a page most people open once. This is one ghost button and
+/// a swap, and the window never changes size, so the fixed-layout premise (and
+/// with it the absence of any scrollbar) survives intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Instrument,
+    Settings,
+}
 
 /// What the window is told about the rest of VISOR each tick.
 ///
@@ -333,6 +352,12 @@ pub struct TuningWindow {
     /// engine itself -- it does not own the command channel -- so it leaves a
     /// note and `ui::tray` posts it.
     pending_preview: Cell<Option<bool>>,
+    /// Which page is showing, and the eight values the second one edits.
+    /// Same discipline as `edits`: owned by the window from the click until
+    /// the pump has written it, so a status push cannot revert it in between.
+    page: Cell<Page>,
+    settings: Cell<Settings>,
+    settings_dirty: Cell<bool>,
 }
 
 impl TuningWindow {
@@ -386,6 +411,13 @@ impl TuningWindow {
             dirty: Cell::new(false),
             gauge_extent: Cell::new((PLATE.1, PLATE.3)),
             pending_preview: Cell::new(None),
+            page: Cell::new(Page::Instrument),
+            // Seeded from defaults and overwritten by the pump's first
+            // `set_settings`. The page cannot be reached without a click, and
+            // a click cannot happen before the window is visible, so nothing
+            // is ever drawn from this placeholder.
+            settings: Cell::new(Settings::from_config(&crate::config::Config::default())),
+            settings_dirty: Cell::new(false),
         });
 
         let class = wide(CLASS_NAME);
@@ -509,6 +541,31 @@ impl TuningWindow {
     pub fn take_edits(&self) -> Option<Editable> {
         if self.dirty.replace(false) {
             Some(self.edits.get())
+        } else {
+            None
+        }
+    }
+
+    /// Push the settings page's values in from config.
+    ///
+    /// Refused while a click is still waiting to be saved: the pump pushes
+    /// every 250ms from a `cfg` it only re-reads on Reload, so adopting one
+    /// mid-flight would put the just-clicked segment back where it was and the
+    /// click would look like it bounced.
+    pub fn set_settings(&self, s: Settings) {
+        if self.settings_dirty.get() || self.settings.get() == s {
+            return;
+        }
+        self.settings.set(s);
+        if self.is_visible() && self.page.get() == Page::Settings {
+            self.invalidate();
+        }
+    }
+
+    /// The settings page's values, if a click changed them. Drained by the pump.
+    pub fn take_settings(&self) -> Option<Settings> {
+        if self.settings_dirty.replace(false) {
+            Some(self.settings.get())
         } else {
             None
         }
@@ -705,6 +762,29 @@ impl TuningWindow {
     }
 
     fn on_click(&self, x: f32, y: f32) {
+        if self.page.get() == Page::Settings {
+            if hit(BACK_BTN, x, y) {
+                self.page.set(Page::Instrument);
+                self.invalidate();
+            } else if let Some((setting, index)) = settings::hit(x, y) {
+                let mut s = self.settings.get();
+                setting.apply(&mut s, index);
+                // Only mark dirty if something moved: clicking the segment
+                // that is already lit should not cost a file write and a
+                // reload of the whole engine.
+                if s != self.settings.get() {
+                    self.settings.set(s);
+                    self.settings_dirty.set(true);
+                    self.invalidate();
+                }
+            }
+            return;
+        }
+        if hit(SETTINGS_BTN, x, y) {
+            self.page.set(Page::Settings);
+            self.invalidate();
+            return;
+        }
         if hit(self.preview_btn(), x, y) {
             self.pending_preview.set(Some(!self.preview_on.get()));
             return;
@@ -886,6 +966,15 @@ impl TuningWindow {
                 &b_t2,
             );
             t.FillRectangle(&rect(0.0, 39.0, WIN_W, 40.0), &b_hair);
+
+            // The camera row above is the one thing both pages need; below the
+            // hairline they share nothing, so the second page takes over here.
+            if self.page.get() == Page::Settings {
+                self.draw_settings_page(
+                    t, &r.fonts, &b_t1, &b_t2, &b_t3, &b_hair, &b_well, &b_strong,
+                );
+                return;
+            }
 
             // ---- status band ------------------------------------------------
             let (name, sub) = state_copy(st.state, st.dim_level);
@@ -1194,6 +1283,178 @@ impl TuningWindow {
                     &b_t2,
                 );
             }
+            // The way to the second page. One ghost button, right-aligned so
+            // it never crowds the two actions.
+            let more = D2D1_ROUNDED_RECT {
+                rect: rect(
+                    SETTINGS_BTN.0,
+                    SETTINGS_BTN.1,
+                    SETTINGS_BTN.2,
+                    SETTINGS_BTN.3,
+                ),
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            t.DrawRoundedRectangle(&more, &b_strong, 1.0, None);
+            text(
+                "Settings \u{2192}",
+                &r.fonts.body,
+                rect(SETTINGS_BTN.0 + 12.0, 667.0, SETTINGS_BTN.2, 688.0),
+                &b_t2,
+            );
+        }
+    }
+
+    /// The settings page: the values that used to live in TOML and nowhere
+    /// else, one segmented choice per row.
+    ///
+    /// Draws nothing saturated. That is not restraint for its own sake — the
+    /// governing rule is that the only chroma in this window carries the
+    /// measurement, and none of these eight settings is a measurement. A lit
+    /// segment is told apart from an unlit one by fill and text weight, which
+    /// is also what makes the page legible in high contrast.
+    ///
+    /// Walks `settings::BLOCKS`, the same table `settings::hit` walks. Two
+    /// copies of these coordinates is how a control ends up drawn in one place
+    /// and clickable in another.
+    ///
+    /// # Safety
+    /// Must be called inside a draw pass.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_settings_page(
+        &self,
+        t: &ID2D1HwndRenderTarget,
+        fonts: &Fonts,
+        b_t1: &ID2D1SolidColorBrush,
+        b_t2: &ID2D1SolidColorBrush,
+        b_t3: &ID2D1SolidColorBrush,
+        b_hair: &ID2D1SolidColorBrush,
+        b_well: &ID2D1SolidColorBrush,
+        b_strong: &ID2D1SolidColorBrush,
+    ) {
+        let s = self.settings.get();
+
+        // SAFETY: the caller guarantees we are inside a draw pass.
+        unsafe {
+            let text =
+                |v: &str, f: &IDWriteTextFormat, r_: D2D_RECT_F, b: &ID2D1SolidColorBrush| {
+                    let w = wide(v);
+                    t.DrawText(
+                        &w[..w.len() - 1],
+                        f,
+                        &r_,
+                        b,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                };
+            let pill = |r_: D2D_RECT_F| D2D1_ROUNDED_RECT {
+                rect: r_,
+                radiusX: 6.0,
+                radiusY: 6.0,
+            };
+            // Option labels are centred in their segment. The formats are
+            // cached for the window's life and shared with page one, so this is
+            // flipped and put back the way `draw_chrome` does it -- leaving it
+            // centred would silently re-align every Body run on the instrument.
+            let align = |f: &IDWriteTextFormat, a: DWRITE_TEXT_ALIGNMENT| {
+                let _ = f.SetTextAlignment(a);
+            };
+            align(&fonts.body, DWRITE_TEXT_ALIGNMENT_CENTER);
+            align(&fonts.body_strong, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+            for block in &settings::BLOCKS {
+                match block {
+                    settings::Block::Section { y, label } => {
+                        text(
+                            label,
+                            &fonts.section,
+                            rect(settings::LEFT, *y, settings::RIGHT, y + settings::SECTION_H),
+                            b_t3,
+                        );
+                    }
+                    settings::Block::Row(row) => {
+                        let selected = row.setting.selected(&s);
+                        text(
+                            row.label,
+                            &fonts.body_strong,
+                            rect(
+                                settings::LEFT,
+                                row.y,
+                                settings::RIGHT,
+                                row.y + settings::LABEL_H,
+                            ),
+                            b_t1,
+                        );
+                        // A value the page does not offer lights no segment, so
+                        // the caption has to carry what IS in force or the row
+                        // reads as broken rather than as hand-tuned.
+                        let caption = match selected {
+                            Some(_) => row.caption.to_string(),
+                            None => format!(
+                                "{} \u{2014} config says {}",
+                                row.caption,
+                                row.setting.current(&s)
+                            ),
+                        };
+                        text(
+                            &caption,
+                            &fonts.caption,
+                            rect(
+                                settings::LEFT,
+                                row.y + settings::CAPTION_DY,
+                                settings::RIGHT,
+                                row.y + settings::CAPTION_DY + settings::CAPTION_H,
+                            ),
+                            b_t3,
+                        );
+
+                        for (i, option) in row.options.iter().enumerate() {
+                            let (l, top, r_, bot) = settings::segment_rect(row, i);
+                            let seg = pill(rect(l, top, r_, bot));
+                            let on = selected == Some(i);
+                            t.FillRoundedRectangle(&seg, if on { b_strong } else { b_well });
+                            if on {
+                                t.DrawRoundedRectangle(&seg, b_hair, 1.0, None);
+                            }
+                            text(
+                                option,
+                                if on { &fonts.body_strong } else { &fonts.body },
+                                rect(l, top + 4.0, r_, bot),
+                                if on { b_t1 } else { b_t2 },
+                            );
+                        }
+                    }
+                }
+            }
+
+            align(&fonts.body, DWRITE_TEXT_ALIGNMENT_LEADING);
+            align(&fonts.body_strong, DWRITE_TEXT_ALIGNMENT_LEADING);
+
+            // ---- footer -------------------------------------------------------
+            t.FillRectangle(
+                &rect(
+                    0.0,
+                    settings::FOOTER_HAIRLINE,
+                    WIN_W,
+                    settings::FOOTER_HAIRLINE + 1.0,
+                ),
+                b_hair,
+            );
+            let back = pill(rect(BACK_BTN.0, BACK_BTN.1, BACK_BTN.2, BACK_BTN.3));
+            t.DrawRoundedRectangle(&back, b_strong, 1.0, None);
+            text(
+                "\u{2190} Back",
+                &fonts.body,
+                rect(BACK_BTN.0 + 12.0, BACK_BTN.1 + 5.0, BACK_BTN.2, BACK_BTN.3),
+                b_t2,
+            );
+            text(
+                "Saved to config.toml as you click.",
+                &fonts.caption,
+                rect(100.0, BACK_BTN.1 + 7.0, CONTENT_R, BACK_BTN.3),
+                b_t3,
+            );
         }
     }
 
@@ -1855,5 +2116,133 @@ mod tests {
         };
         assert!(!w.is_visible(), "must not appear until asked for");
         assert!(!w.hwnd.0.is_null(), "a real HWND was created");
+    }
+
+    // ---- the settings page -------------------------------------------------
+
+    /// Centre of the option `index` in the row for `setting`, in window
+    /// coordinates. Uses the same table the painter and the hit test use, so a
+    /// test cannot pass by clicking somewhere nothing is drawn.
+    fn segment_centre(setting: settings::Setting, index: usize) -> (f32, f32) {
+        let row = settings::rows()
+            .find(|r| r.setting == setting)
+            .expect("the page must have a row for this setting");
+        let (l, t, r, b) = settings::segment_rect(row, index);
+        ((l + r) / 2.0, (t + b) / 2.0)
+    }
+
+    #[test]
+    fn the_footer_button_opens_the_settings_page_and_back_returns() {
+        let w = win();
+        assert_eq!(w.page.get(), Page::Instrument);
+        w.on_click(
+            (SETTINGS_BTN.0 + SETTINGS_BTN.2) / 2.0,
+            (SETTINGS_BTN.1 + SETTINGS_BTN.3) / 2.0,
+        );
+        assert_eq!(w.page.get(), Page::Settings);
+        w.on_click(
+            (BACK_BTN.0 + BACK_BTN.2) / 2.0,
+            (BACK_BTN.1 + BACK_BTN.3) / 2.0,
+        );
+        assert_eq!(w.page.get(), Page::Instrument);
+    }
+
+    #[test]
+    fn clicking_a_segment_changes_that_setting_and_asks_for_a_save() {
+        let w = win();
+        w.page.set(Page::Settings);
+        let before = w.settings.get();
+        assert!(w.take_settings().is_none(), "nothing to save yet");
+
+        // Default face_confirm is 2, which is index 1; move it to 4.
+        let (x, y) = segment_centre(settings::Setting::FaceConfirm, 3);
+        w.on_click(x, y);
+
+        let saved = w.take_settings().expect("a click must ask for a save");
+        assert_eq!(saved.face_confirm, 4);
+        assert_eq!(
+            Settings {
+                face_confirm: before.face_confirm,
+                ..saved
+            },
+            before,
+            "a click must move exactly one setting"
+        );
+        assert!(w.take_settings().is_none(), "draining consumes it");
+    }
+
+    #[test]
+    fn clicking_the_segment_already_lit_asks_for_nothing() {
+        // Otherwise every stray click on the current value costs a file write
+        // and a full engine reload.
+        let w = win();
+        w.page.set(Page::Settings);
+        let (x, y) = segment_centre(settings::Setting::FaceConfirm, 1);
+        w.on_click(x, y);
+        assert!(w.take_settings().is_none());
+    }
+
+    #[test]
+    fn a_config_push_cannot_revert_a_click_that_is_not_yet_saved() {
+        // The pump pushes every 250ms from a `cfg` it only re-reads on Reload,
+        // so the push that lands between the click and the save still carries
+        // the OLD value. Adopting it would make the click look like it bounced.
+        let w = win();
+        w.page.set(Page::Settings);
+        let stale = w.settings.get();
+        let (x, y) = segment_centre(settings::Setting::WakeConfirm, 2);
+        w.on_click(x, y);
+
+        w.set_settings(stale);
+        assert_eq!(w.settings.get().wake_confirm, 3, "the click must survive");
+        assert_eq!(w.take_settings().map(|s| s.wake_confirm), Some(3));
+
+        // Once drained, a push is welcome again.
+        w.set_settings(stale);
+        assert_eq!(w.settings.get(), stale);
+    }
+
+    #[test]
+    fn the_instrument_controls_are_dead_while_the_settings_page_shows() {
+        // The rail and the gauge are still hit-testable arithmetic; only the
+        // page check stops a click at a marker's coordinates from grabbing it
+        // through a page that does not draw it.
+        let w = win();
+        let a = rail_axis();
+        let (x, y) = (a.pixel_of(w.edits.get().idle_grace), RAIL_TOP + 4.0);
+        assert_eq!(w.hit_handle(x, y), Some(Grab::IdleGrace));
+
+        w.page.set(Page::Settings);
+        w.on_click(x, y);
+        assert!(
+            w.grab.get().is_none(),
+            "the sequence rail is not on this page and must not be grabbable"
+        );
+    }
+
+    #[test]
+    fn painting_the_settings_page_does_not_crash() {
+        // Same reason as `painting_does_not_crash`: this walks a table of
+        // eleven blocks through DirectWrite and Direct2D, and nothing else
+        // would notice a bad rect until it was on screen.
+        let w = win();
+        w.page.set(Page::Settings);
+        w.paint();
+        assert!(w.renderer.borrow().is_some());
+    }
+
+    #[test]
+    fn a_theme_click_writes_a_theme_the_window_can_read_back() {
+        // `theme` is the one setting that round-trips through a String, and it
+        // is the window's own palette on the other side of that trip.
+        let w = win();
+        w.page.set(Page::Settings);
+        let (x, y) = segment_centre(settings::Setting::Theme, 2);
+        w.on_click(x, y);
+        let s = w.take_settings().expect("a theme click must save");
+        let mut cfg = crate::config::Config::default();
+        s.write_into(&mut cfg);
+        assert_eq!(Theme::parse(&cfg.ui.theme), Theme::Oled);
+        assert!(cfg.validate().is_ok());
     }
 }

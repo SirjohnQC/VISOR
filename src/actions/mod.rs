@@ -265,6 +265,21 @@ impl Resolver {
     /// -> 1 with no way back short of the monitor's own OSD. Putting the panel
     /// back to the saved value before discarding the handles that know it is
     /// what keeps the readback honest.
+    /// Adopt a changed `[display]` section, then re-probe.
+    ///
+    /// `rescan` on its own re-opens the same monitors with whatever strategy
+    /// this `Resolver` was *built* with, so a `strategy` change — from the
+    /// tuning window or by hand plus Reload — would appear to save and then do
+    /// nothing at all until the next start. The strategy has to be adopted
+    /// here, on the main thread, for the same reason the rescan does: ruling
+    /// F8 puts the `Resolver` on this side of the channel and `Engine::reload`
+    /// cannot reach it.
+    pub fn reconfigure(&mut self, cfg: &DisplayConfig) {
+        self.strategy = cfg.strategy.clone();
+        self.configured = cfg.targets.clone();
+        self.rescan();
+    }
+
     pub fn rescan(&mut self) {
         let restored = self.restore();
         // Captured before the old handles are dropped: if the restore did not

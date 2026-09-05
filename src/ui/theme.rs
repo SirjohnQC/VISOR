@@ -48,6 +48,16 @@ impl Theme {
         }
     }
 
+    /// The spelling `parse` reads back, so the settings page can write a theme
+    /// to `config.toml` without a second table of strings to keep in step.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+            Theme::Oled => "oled",
+        }
+    }
+
     pub fn is_dark(self) -> bool {
         matches!(self, Theme::Dark | Theme::Oled)
     }

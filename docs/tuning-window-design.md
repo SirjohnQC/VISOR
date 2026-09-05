@@ -94,15 +94,37 @@ Rail block internal lanes, relative to y448: marker labels 0–14, handle lane
 
 ## 4. Control inventory
 
-Five types. That is the budget. Explicitly **not** introduced: scrollbar, text
+Six types. That is the budget. Explicitly **not** introduced: scrollbar, text
 input, dropdown, checkbox/toggle, tabs, accordion, hover tooltips (every hover
 explanation is instead a permanent inline caption).
 
-The GUI edits exactly six values — the ones that fail silently:
+**Page one — the instrument** edits the six values that fail silently:
 `min_face_ratio`, `idle_grace`, `dim_after`, `away_after`, `deep_after`,
-`dim_level`. Everything else stays in TOML and is displayed read-only where
-relevant. Adding `hold_awake_while_present` would cost a whole toggle control
-for one boolean; don't.
+`dim_level`. Nothing else ever goes on this face.
+
+**Page two — settings** edits the other eight: `sample_interval`,
+`away_sample`, `face_confirm`, `wake_confirm`, `wake_probation`,
+`hold_awake_while_present`, `strategy`, `theme`.
+
+This revises an earlier ruling in this file, which said adding
+`hold_awake_while_present` would cost a whole toggle control for one boolean,
+so don't. The objection was right and the conclusion was wrong: the cost is not
+one toggle, it is a *page*, and a page pays for all eight at once. Three things
+made it affordable, and all three are load-bearing —
+
+1. **The window never resizes.** Page two is 420×696 like page one, so the
+   fixed-layout premise survives and no scrollbar is needed. The size is what
+   the ban on scrollbars actually rests on; the page count is not.
+2. **The instrument face gains one ghost button**, in the footer, which is a
+   C4 that already existed. No tab strip, no accordion — those were banned
+   because they put chrome on the instrument, and this puts none there.
+3. **Every setting on page two is a small closed set of sensible values.**
+   Nobody wants `sample_interval = 2.7s`. So all eight are one control, C6,
+   and there is no dropdown, checkbox or radio anywhere: three banned types
+   replaced by one, with nothing hidden behind a collapsed menu.
+
+Implemented in `src/ui/settings.rs` — pure, like `controls.rs`, and holding the
+one table that both the painter and the hit test walk.
 
 ### C0 — Marker (shared primitive)
 
@@ -141,6 +163,56 @@ calm UI. Danger variant (Quit only): hover border and text go `danger`.
 ### C5 — Chip
 Non-interactive pill, height 20, radius 10, optional 6px leading dot. Camera
 status, display mechanism, forced-strategy note.
+
+### C6 — Choice
+A row of 2–4 segments sharing the content column evenly, 24 tall, radius 6,
+6px gaps. Unselected: `well` fill, Body, `t2`. Selected: `strong` fill, a 1px
+`hair` outline, Body strong, `t1`. Eight instances, all on page two, and the
+only control type that page has.
+
+No chroma, by the governing rule — none of these eight settings is a
+measurement. Selection is carried by fill *and* text weight so it survives high
+contrast, where a fill difference alone would not.
+
+**A value the config holds that the row does not offer lights nothing.** Not
+the nearest neighbour: showing `2s` selected while the file says `4s` would be
+a lie, and clicking to "fix" it would overwrite something a user typed on
+purpose. The caption instead gains ` — config says 4s`, so a hand-tuned row
+reads as hand-tuned rather than as broken.
+
+Clicking the segment already lit does nothing at all. Every other click writes
+`config.toml` immediately and posts a `Reload`; there is no Apply button,
+because a settings page with an unsaved state is a settings page that can lose
+your change.
+
+### Page two layout
+
+Same 420×696, same title bar, same footer hairline at y654. Content runs y52 →
+y654 as three sections of rows. A row is 58 tall: label 0–15, caption 16–31,
+segments 34–58. Sections are 16 tall with 6px under them; rows are 6px apart,
+14px before the next section.
+
+| y | Block |
+|---|---|
+| 52 | `W A T C H I N G` |
+| 74 / 138 / 202 | `sample_interval` · `away_sample` · `face_confirm` |
+| 274 | `W A K I N G` |
+| 296 / 360 / 424 | `wake_confirm` · `wake_probation` · `hold_awake_while_present` |
+| 496 | `D I S P L A Y` |
+| 518 / 582 | `strategy` · `theme` |
+| 662 | `← Back`, and a Caption saying the page saves as you click |
+
+Every one of those numbers lives once, in `settings::BLOCKS`, which the painter
+and the hit test both walk. A layout test proves the blocks neither overlap nor
+run past the hairline — with no scrollbar, a row that does not fit is a row
+that is simply unreachable.
+
+**Two settings take effect on the pump thread, not in the engine**: `theme` is
+the window's own palette, and `strategy` belongs to the `Resolver`, which
+ruling F8 keeps on this side of the channel. `Resolver::reconfigure` exists for
+the second one — a plain `rescan` re-probes with the strategy the `Resolver`
+was *built* with, so the setting would have saved and then done nothing until
+the next start.
 
 ---
 

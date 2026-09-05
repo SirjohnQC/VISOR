@@ -195,8 +195,10 @@ pub fn run(
                     }
                     // Ruling F8: the `Resolver` lives on this thread, not the
                     // engine's, so a reload has to be actioned here too —
-                    // `Engine::reload` cannot reach it.
-                    resolver.rescan();
+                    // `Engine::reload` cannot reach it. `reconfigure` rather
+                    // than `rescan` because `strategy` lives in this file too,
+                    // and a rescan alone would re-probe with the old one.
+                    resolver.reconfigure(&cfg.display);
                 }
                 // A send failure means the engine thread is already gone;
                 // quitting is then the only sensible response.
@@ -282,6 +284,33 @@ pub fn run(
                 away_after: cfg.presence.away_after.as_secs_f32(),
                 deep_after: cfg.presence.deep_after.as_secs_f32(),
             });
+            w.set_settings(crate::ui::settings::Settings::from_config(&cfg));
+        }
+
+        // Draining is deliberately NOT behind `is_visible`. A click or a drag
+        // release marks the window dirty, and the pump only comes back here
+        // 250ms later — long enough to close the window in between, which
+        // would otherwise throw the change away with no sign it ever happened.
+        if let Some(w) = tuning_window.as_ref() {
+            // A segment was clicked on the settings page. Written the same way
+            // a drag is, but two of the eight only take effect on this thread:
+            // `theme` is the window's own palette, and `strategy` is the
+            // Resolver's, which the engine cannot reach.
+            if let Some(s) = w.take_settings() {
+                s.write_into(&mut cfg);
+                match cfg.save(&crate::config::Config::default_path()) {
+                    Ok(()) => {
+                        w.set_theme(Theme::parse(&cfg.ui.theme));
+                        resolver.reconfigure(&cfg.display);
+                        if tx.send(Command::Reload).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "could not save the settings change")
+                    }
+                }
+            }
 
             // Drag released: write it back and tell the engine to re-read.
             if let Some(e) = w.take_edits() {
